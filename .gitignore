@@ -7,4 +7,4 @@ build
 old_pth/*
 chess_model.pth
 old_pth/chess_model.pth
-chess_ai.exe
+dist/chess_ai.exe

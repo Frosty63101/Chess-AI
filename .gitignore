@@ -1,0 +1,10 @@
+.vscode
+__pycache__
+*.pyc
+build
+*.pth
+*.spec
+old_pth/*
+chess_model.pth
+old_pth/chess_model.pth
+chess_ai.exe

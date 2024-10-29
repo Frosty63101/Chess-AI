@@ -23,77 +23,89 @@ MODEL_PATH = "chess_model.pth"
 class ChessNet(nn.Module):
     def __init__(self):
         super(ChessNet, self).__init__()
-        # Initial Convolutional layers with increased depth and feature maps
+        
+        # Convolutional layers with increased depth and feature maps
         self.conv1 = nn.Conv2d(12, 64, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
         self.conv3 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
         self.conv4 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
         self.conv5 = nn.Conv2d(256, 512, kernel_size=3, padding=1)
         self.pool = nn.MaxPool2d(2, 2)
-
-        # First Residual Block
-        self.residual_block1 = nn.Sequential(
-            nn.Conv2d(512, 512, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(512, 512, kernel_size=3, padding=1)
-        )
-
-        # Second Residual Block
-        self.residual_block2 = nn.Sequential(
-            nn.Conv2d(512, 512, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(512, 512, kernel_size=3, padding=1)
-        )
-
+        
+        # Residual Blocks for capturing patterns
+        self.residual_block1 = self._make_residual_block(512)
+        self.residual_block2 = self._make_residual_block(512)
+        self.residual_block3 = self._make_residual_block(512)  # New residual block
+        
+        # Positional Encoding
+        self.positional_encoding = nn.Parameter(torch.randn(1, 12, 8, 8))
+        
         # Fully connected layers with increased units and Dropout for regularization
         self.fc1 = nn.Linear(512 * 2 * 2, 1024)
         self.fc2 = nn.Linear(1024, 512)
         self.fc3 = nn.Linear(512, 128)
         self.fc4 = nn.Linear(128, 1)
         
-        # Dropout layer with a probability of 0.4 to prevent overfitting
+        # Dropout layer to prevent overfitting
         self.dropout = nn.Dropout(0.4)
 
+    def _make_residual_block(self, channels):
+        return nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        )
+
     def forward(self, x):
-        # Pass through initial convolutional layers
+        x += self.positional_encoding  # Adding positional encoding
         x = torch.relu(self.conv1(x))
         x = self.pool(torch.relu(self.conv2(x)))
         x = torch.relu(self.conv3(x))
         x = self.pool(torch.relu(self.conv4(x)))
         x = torch.relu(self.conv5(x))
         
-        # Apply first residual block with skip connection
-        residual1 = x
-        x = self.residual_block1(x)
-        x += residual1  # Skip connection
+        # Apply Residual Blocks
+        x = self._apply_residual(x, self.residual_block1)
+        x = self._apply_residual(x, self.residual_block2)
+        x = self._apply_residual(x, self.residual_block3)  # Additional block
         
-        # Apply second residual block with skip connection
-        residual2 = x
-        x = self.residual_block2(x)
-        x += residual2  # Skip connection
-
-        # Flatten the output for fully connected layers
+        # Flatten for fully connected layers
         x = x.view(-1, 512 * 2 * 2)
         x = torch.relu(self.fc1(x))
         x = self.dropout(x)
         x = torch.relu(self.fc2(x))
         x = torch.relu(self.fc3(x))
-        x = self.fc4(x)  # No activation for the output layer
+        x = self.fc4(x)
         
         return x
+    
+    def _apply_residual(self, x, block):
+        residual = x
+        x = block(x)
+        x += residual  # Skip connection
+        return x
 
-def simulate(state, model):
-    if state.is_game_over():
-        result = state.result()
-        if result == "1-0":
-            return 1
-        elif result == "0-1":
-            return -1
-        else:
-            return 0
-    input_tensor = board_to_tensor(state).unsqueeze(0)
-    with torch.no_grad():
-        return model(input_tensor).item()
+def minimax_move(stockfish, board, depth=2):
+    best_eval = -float('inf')
+    best_move = None
+    for move in board.legal_moves:
+        board.push(move)
+        score = minimax_evaluate(model, board, device, depth - 1, is_maximizing=False)
+        board.pop()
+        if score > best_eval:
+            best_eval = score
+            best_move = move
+    return best_move
+
+def evaluate_board(stockfish, board):
+    stockfish.set_fen_position(board.fen())
+    stockfish_eval = stockfish.get_evaluation()
+    if stockfish_eval['type'] == 'cp':
+        return stockfish_eval['value'] / 100.0
+    elif stockfish_eval['type'] == 'mate':
+        return np.sign(stockfish_eval['value']) * 1000.0
+    return 0.0
+
 
 def board_to_tensor(board):
     piece_to_channel = {
@@ -121,40 +133,47 @@ def board_to_tensor(board):
             board_tensor[channel, y, x] = 1
     return torch.tensor(board_tensor, dtype=torch.float32)
 
-def select_best_move(model, board, device):
-    was_training = model.training
-    model.eval()
-    legal_moves = list(board.legal_moves)
-    best_eval = -float('inf')
-    best_move = None
-    repetition_penalty = 0.1  # Penalty applied if a move results in repetition
-
-    for move in legal_moves:
-        board.push(move)
-        
-        # Check for repetitions to apply penalty
-        if board.is_repetition(3):
-            penalty = repetition_penalty
-        else:
-            penalty = 0.0
-
-        # Get the evaluation score from the model
+def minimax_evaluate(model, board, device, depth, is_maximizing):
+    if depth == 0 or board.is_game_over():
+        # Evaluate the board with the model
         state = board_to_tensor(board).unsqueeze(0).to(device)
         with torch.no_grad():
-            eval_score = model(state).item() - penalty  # Apply penalty if repeated
+            return model(state).item()
 
-        # Check if this move is better than the current best
+    best_eval = -float('inf') if is_maximizing else float('inf')
+    for move in board.legal_moves:
+        board.push(move)
+        eval_score = minimax_evaluate(model, board, device, depth - 1, not is_maximizing)
+        board.pop()
+        
+        if is_maximizing:
+            best_eval = max(best_eval, eval_score)
+        else:
+            best_eval = min(best_eval, eval_score)
+
+    return best_eval
+
+def select_best_move(model, board, device, depth=2):
+    was_training = model.training
+    model.eval()
+    best_eval = -float('inf')
+    best_move = None
+
+    for move in board.legal_moves:
+        board.push(move)
+        
+        # Perform a minimax search to evaluate the move with depth
+        eval_score = minimax_evaluate(model, board, device, depth - 1, is_maximizing=False)
+        
         if eval_score > best_eval:
             best_eval = eval_score
             best_move = move
+        board.pop()
 
-        board.pop()  # Undo move to explore other options
-
-    # Restore model training mode if it was initially training
     if was_training:
         model.train()
-    return best_move if best_move else random.choice(legal_moves)
 
+    return best_move if best_move else random.choice(list(board.legal_moves))
 
 def train(model, stockfish_path, episodes=1000, lr=0.001, stop_event=None, current_loss=None, current_episode=None, root=None, batch_size=32):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

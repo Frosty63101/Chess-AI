@@ -22,42 +22,34 @@ class TranspositionEntry(TypedDict):
     pv_move: Optional[chess.Move]  # Principal Variation move
 
 
-MODEL_PATH = "chess_model.pth"  # Ensure this path matches the model's location
+MODEL_PATH = "chess_model1.pth"  # Ensure this path matches the model's location
 
 class ChessNet(nn.Module):
-    """Neural network model for evaluating chess positions."""
     def __init__(self):
         super(ChessNet, self).__init__()
         
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
         # Convolutional layers with increased depth and feature maps
         self.conv1 = nn.Conv2d(12, 64, kernel_size=3, padding=1)
-        self.batch_norm1 = nn.BatchNorm2d(64)
         self.conv2 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
-        self.batch_norm2 = nn.BatchNorm2d(128)
         self.conv3 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
-        self.batch_norm3 = nn.BatchNorm2d(128)
         self.conv4 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
-        self.batch_norm4 = nn.BatchNorm2d(256)
         self.conv5 = nn.Conv2d(256, 512, kernel_size=3, padding=1)
-        self.batch_norm5 = nn.BatchNorm2d(512)
         self.pool = nn.MaxPool2d(2, 2)
-
+        
         # Residual Blocks for capturing patterns
         self.residual_block1 = self._make_residual_block(512)
         self.residual_block2 = self._make_residual_block(512)
-        self.residual_block3 = self._make_residual_block(512)  # Additional residual block
-
+        self.residual_block3 = self._make_residual_block(512)  # New residual block
+        
         # Positional Encoding
         self.positional_encoding = nn.Parameter(torch.randn(1, 12, 8, 8))
-
+        
         # Fully connected layers with increased units and Dropout for regularization
         self.fc1 = nn.Linear(512 * 2 * 2, 1024)
         self.fc2 = nn.Linear(1024, 512)
         self.fc3 = nn.Linear(512, 128)
         self.fc4 = nn.Linear(128, 1)
-
+        
         # Dropout layer to prevent overfitting
         self.dropout = nn.Dropout(0.4)
 
@@ -70,27 +62,27 @@ class ChessNet(nn.Module):
 
     def forward(self, x):
         x += self.positional_encoding  # Adding positional encoding
-        x = torch.relu(self.batch_norm1(self.conv1(x)))
-        x = self.pool(torch.relu(self.batch_norm2(self.conv2(x))))
-        x = torch.relu(self.batch_norm3(self.conv3(x)))
-        x = self.pool(torch.relu(self.batch_norm4(self.conv4(x))))
-        x = torch.relu(self.batch_norm5(self.conv5(x)))
-
+        x = torch.relu(self.conv1(x))
+        x = self.pool(torch.relu(self.conv2(x)))
+        x = torch.relu(self.conv3(x))
+        x = self.pool(torch.relu(self.conv4(x)))
+        x = torch.relu(self.conv5(x))
+        
         # Apply Residual Blocks
         x = self._apply_residual(x, self.residual_block1)
         x = self._apply_residual(x, self.residual_block2)
         x = self._apply_residual(x, self.residual_block3)  # Additional block
-
+        
         # Flatten for fully connected layers
         x = x.view(-1, 512 * 2 * 2)
         x = torch.relu(self.fc1(x))
         x = self.dropout(x)
         x = torch.relu(self.fc2(x))
         x = torch.relu(self.fc3(x))
-        x = self.fc4(x)  # No activation function
-
+        x = self.fc4(x)
+        
         return x
-
+    
     def _apply_residual(self, x, block):
         residual = x
         x = block(x)

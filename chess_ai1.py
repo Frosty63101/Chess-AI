@@ -22,7 +22,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import queue  # New import for logging
 
 # Constants
-MODEL_PATH = "chess_model.pth"
+MODEL_PATH = "chess_model1.pth"
 STOCKFISH_DEFAULT_PATH = "stockfish-windows-x86-64-avx2\\stockfish\\stockfish-windows-x86-64-avx2.exe"  # Update this path as needed
 IMAGE_DIR = "images"  # Directory containing piece images
 
@@ -45,15 +45,10 @@ class ChessNet(nn.Module):
 
         # Convolutional layers with increased depth and feature maps
         self.conv1 = nn.Conv2d(12, 64, kernel_size=3, padding=1)
-        self.batch_norm1 = nn.BatchNorm2d(64)
         self.conv2 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
-        self.batch_norm2 = nn.BatchNorm2d(128)
         self.conv3 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
-        self.batch_norm3 = nn.BatchNorm2d(128)
         self.conv4 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
-        self.batch_norm4 = nn.BatchNorm2d(256)
         self.conv5 = nn.Conv2d(256, 512, kernel_size=3, padding=1)
-        self.batch_norm5 = nn.BatchNorm2d(512)
         self.pool = nn.MaxPool2d(2, 2)
 
         # Residual Blocks for capturing patterns
@@ -82,11 +77,11 @@ class ChessNet(nn.Module):
 
     def forward(self, x):
         x += self.positional_encoding  # Adding positional encoding
-        x = torch.relu(self.batch_norm1(self.conv1(x)))
-        x = self.pool(torch.relu(self.batch_norm2(self.conv2(x))))
-        x = torch.relu(self.batch_norm3(self.conv3(x)))
-        x = self.pool(torch.relu(self.batch_norm4(self.conv4(x))))
-        x = torch.relu(self.batch_norm5(self.conv5(x)))
+        x = torch.relu(self.conv1(x))
+        x = self.pool(torch.relu(self.conv2(x)))
+        x = torch.relu(self.conv3(x))
+        x = self.pool(torch.relu(self.conv4(x)))
+        x = torch.relu(self.conv5(x))
 
         # Apply Residual Blocks
         x = self._apply_residual(x, self.residual_block1)
@@ -99,7 +94,7 @@ class ChessNet(nn.Module):
         x = self.dropout(x)
         x = torch.relu(self.fc2(x))
         x = torch.relu(self.fc3(x))
-        x = self.fc4(x)  # No activation function
+        x = self.fc4(x)
 
         return x
 
@@ -317,7 +312,7 @@ def periodic_evaluation(ai: ChessAI, episodes: int = 5, skill_level: int = 10):
 def train(
     ai: ChessAI,
     episodes: int = 1000,
-    lr: float = 0.0005,
+    lr: float = 0.001,
     stop_event: Optional[threading.Event] = None,
     current_loss: Optional[list] = None,
     current_episode: Optional[list] = None,
@@ -334,7 +329,7 @@ def train(
     stockfish = ai.stockfish
     stockfish.set_skill_level(20)
     optimizer = optim.Adam(model.parameters(), lr=lr) # type: ignore
-    criterion = nn.MSELoss()
+    criterion = nn.SmoothL1Loss()
 
     # Replay buffer for experience replay
     replay_buffer = deque(maxlen=buffer_size)
@@ -377,6 +372,7 @@ def train(
             else:
                 stockfish_value = 0.0
 
+            stockfish_value = np.clip(stockfish_value, -10, 10)
             target_eval = torch.tensor([stockfish_value], dtype=torch.float32).to(device)
 
             # Store the experience
@@ -395,7 +391,6 @@ def train(
             outputs = model(states.to(device)) # type: ignore
             loss = criterion(outputs, targets.to(device))
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # type: ignore
             optimizer.step()
 
             if current_loss is not None:
@@ -776,7 +771,7 @@ def main():
             args=(
                 ai,
                 episodes,
-                0.0005,
+                0.001,
                 stop_event,
                 current_loss,
                 current_episode,

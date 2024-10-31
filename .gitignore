@@ -8,3 +8,4 @@ old_pth/chess_model.pth
 dist/chess_ai.exe
 chess_model.pth
 old_pth/
+dist/play.exe

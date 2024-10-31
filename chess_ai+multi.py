@@ -660,7 +660,7 @@ def play_against_stockfish(ai: ChessAI, skill_level: int = 10):
     # Load piece images
     piece_images = {}
     pieces = ['P', 'N', 'B', 'R', 'Q', 'K',
-              'p', 'n', 'b', 'r', 'q', 'k']
+                'p', 'n', 'b', 'r', 'q', 'k']
     for piece in pieces:
         if piece.isupper():
             filename = os.path.join(IMAGE_DIR, f"{piece}.png")

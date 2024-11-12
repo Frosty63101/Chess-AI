@@ -82,9 +82,9 @@ class ChessNet(nn.Module):
     """Neural network model for evaluating chess positions."""
     def __init__(self):
         super(ChessNet, self).__init__()
-        # Build your network layers here
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.conv_block = nn.Sequential(
-            nn.Conv2d(12, 256, kernel_size=3, padding=1),
+            nn.Conv2d(13, 256, kernel_size=3, padding=1),  # Changed from 12 to 13 input channels
             nn.BatchNorm2d(256),
             nn.ReLU()
         )
@@ -235,16 +235,43 @@ def init_model():
     model_instance.eval()
 
 @lru_cache(maxsize=20000)
-def cached_board_evaluation(board_fen):
-    board = chess.Board(fen=board_fen)
-    # Use the device where the model's parameters are located
-    device = next(model_instance.parameters()).device
-    state = board_to_tensor(board).unsqueeze(0).to(device)
+def cached_board_evaluation(fen: str) -> float:
+    """Evaluates the board using material balance and the neural network."""
+    board = chess.Board(fen)
+    # Material evaluation
+    material_score = material_evaluation(board)
+    # Neural network evaluation
+    state = board_to_tensor(board).unsqueeze(0).to(model_instance.device)
     with torch.no_grad():
         _, value = model_instance(state)
-        return value.item()
+        nn_eval = value.item()
+    # Combine evaluations
+    eval_score = nn_eval + material_score
+    return eval_score
 
-def board_to_tensor(board):
+def material_evaluation(board: chess.Board) -> float:
+    """Calculates the material balance of the board."""
+    piece_values = {
+        chess.PAWN: 1,
+        chess.KNIGHT: 3,
+        chess.BISHOP: 3,
+        chess.ROOK: 5,
+        chess.QUEEN: 9,
+        chess.KING: 0  # King's value is not added to material score
+    }
+    white_material = 0
+    black_material = 0
+    for piece_type in piece_values:
+        white_material += len(board.pieces(piece_type, chess.WHITE)) * piece_values[piece_type]
+        black_material += len(board.pieces(piece_type, chess.BLACK)) * piece_values[piece_type]
+    # Positive score if white is ahead, negative if black is ahead
+    material_score = white_material - black_material
+    # Normalize the score
+    material_score /= 39  # Max possible material value difference
+    return material_score
+
+def board_to_tensor(board: chess.Board) -> torch.Tensor:
+    """Converts a chess board to a tensor representation with piece values."""
     piece_to_channel = {
         'P': 0,  # White Pawn
         'N': 1,  # White Knight
@@ -256,19 +283,38 @@ def board_to_tensor(board):
         'n': 7,  # Black Knight
         'b': 8,  # Black Bishop
         'r': 9,  # Black Rook
-        'q': 10,  # Black Queen
-        'k': 11   # Black King
+        'q':10,  # Black Queen
+        'k':11   # Black King
+    }
+    piece_values = {
+        'P': 1,
+        'N': 3,
+        'B': 3,
+        'R': 5,
+        'Q': 9,
+        'K': 0,
+        'p': -1,
+        'n': -3,
+        'b': -3,
+        'r': -5,
+        'q': -9,
+        'k': 0
     }
     board_tensor = np.zeros((12, 8, 8), dtype=np.float32)
+    value_tensor = np.zeros((1, 8, 8), dtype=np.float32)
     for square in chess.SQUARES:
         piece = board.piece_at(square)
         if piece:
             piece_symbol = piece.symbol()
             channel = piece_to_channel[piece_symbol]
+            value = piece_values[piece_symbol]
             x = square % 8
             y = 7 - (square // 8)
             board_tensor[channel, y, x] = 1
-    return torch.tensor(board_tensor, dtype=torch.float32)
+            value_tensor[0, y, x] = value
+    # Combine piece presence and value tensors
+    combined_tensor = np.concatenate((board_tensor, value_tensor), axis=0)
+    return torch.tensor(combined_tensor, dtype=torch.float32)
 
 def evaluate_move(task):
     move, board_fen, depth = task

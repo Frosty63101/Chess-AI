@@ -6,6 +6,7 @@ import threading
 import tkinter as tk
 from tkinter import messagebox
 from collections import deque, defaultdict
+from tracemalloc import start
 from typing import Dict, Optional
 
 import chess
@@ -15,9 +16,15 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+from torch.amp.autocast_mode import autocast
 from PIL import Image, ImageTk
 from stockfish import Stockfish
 from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
+import multiprocessing as mp
+from torch.utils.data import DataLoader, Dataset
+from torch.amp.grad_scaler import GradScaler
+from chess.polyglot import zobrist_hash
 
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -25,55 +32,26 @@ import queue  # For logging
 
 import time
 
+print(chess.__version__)
+
 # Constants
-MODEL_PATH = "chess_model+multi.pth"
+MODEL_PATH = "chess_model.pth"
+BACKUP_MODEL_PATH = "backup_models/"
 STOCKFISH_DEFAULT_PATH = "stockfish-windows-x86-64-avx2\\stockfish\\stockfish-windows-x86-64-avx2.exe"  # Update this path as needed
 IMAGE_DIR = "images"  # Directory containing piece images
 ACTION_SIZE = 4672  # Total possible moves in our action space
+MIN_EVAL = -10.0  # Defined min evaluation
+MAX_EVAL = 10.0   # Defined max evaluation
+MAX_DEPTH = 100   # Maximum depth for killer moves
+MAX_TIME = 1.0    # Max time in seconds for move selection
 
 # Global model instance
 model_instance = None  # Will be initialized in main()
 
-class TranspositionEntry:
-    """Data structure for transposition table entries."""
-    def __init__(self, eval_score: Optional[float] = None, freq: int = 0, pv_move: Optional[chess.Move] = None):
-        self.eval = eval_score
-        self.freq = freq
-        self.pv_move = pv_move
-
-class Node:
-    def __init__(self, parent, prior_prob):
-        self.parent = parent
-        self.children = {}  # action: Node
-        self.visit_count = 0
-        self.total_value = 0
-        self.prior_prob = prior_prob
-
-    def select_child(self):
-        C_PUCT = 1.0  # Exploration constant
-        best_score = -float('inf')
-        best_action = None
-        best_child = None
-        for action, child in self.children.items():
-            u = C_PUCT * child.prior_prob * (math.sqrt(self.visit_count) / (1 + child.visit_count))
-            q = child.total_value / (1 + child.visit_count)
-            score = q + u
-            if score > best_score:
-                best_score = score
-                best_action = action
-                best_child = child
-        return best_action, best_child
-
-    def expand(self, action_priors):
-        for action, prob in action_priors:
-            if action not in self.children:
-                self.children[action] = Node(self, prob)
-
-    def backpropagate(self, value):
-        self.visit_count += 1
-        self.total_value += value
-        if self.parent:
-            self.parent.backpropagate(-value)
+# Locks for thread safety
+transposition_table_lock = threading.Lock()
+eval_cache_lock = threading.Lock()
+board_tensor_cache_lock = threading.Lock()
 
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
@@ -90,13 +68,158 @@ class ResidualBlock(nn.Module):
         out += residual
         return F.relu(out)
 
+def iterative_deepening(board: chess.Board, ai: 'ChessAI', max_time: float = MAX_TIME) -> Optional[chess.Move]:
+    """Performs iterative deepening search within a time limit."""
+    best_move = None
+    depth = 1
+    start_time = time.time()
+    while True:
+        time_elapsed = time.time() - start_time
+        if time_elapsed >= max_time:
+            break
+        ai.search_stop = False
+        try:
+            best_move = ai.search(board, depth, start_time, max_time)
+        except TimeoutError:
+            break
+        depth += 1
+    return best_move
+
+def principal_variation_search(board: chess.Board, depth: int, alpha: float, beta: float, maximizing_player: bool, ai: 'ChessAI', start_time: float, max_time: float) -> float:
+    """Principal Variation Search algorithm with alpha-beta pruning and time management."""
+    # Check for timeout
+    if time.time() - start_time >= max_time or ai.search_stop:
+        ai.search_stop = True
+        raise TimeoutError("Search timed out")
+
+    # Transposition Table Lookup
+    transposition_key = zobrist_hash(board)
+    with transposition_table_lock:
+        if transposition_key in ai.transposition_table:
+            entry = ai.transposition_table[transposition_key]
+            if entry['depth'] >= depth:
+                return entry['value']
+
+    if board.is_game_over() or depth == 0:
+        eval = quiescence_search(board, alpha, beta, ai, start_time, max_time)
+        with transposition_table_lock:
+            ai.transposition_table[transposition_key] = {'value': eval, 'depth': depth}
+        return eval
+
+    moves = ai.order_moves(board, depth)
+    if not moves:
+        return evaluate_board(board, ai)
+
+    first_child = True
+    for move in moves:
+        board.push(move)
+        try:
+            if first_child:
+                score = -principal_variation_search(board, depth - 1, -beta, -alpha, not maximizing_player, ai, start_time, max_time)
+            else:
+                score = -principal_variation_search(board, depth - 1, -alpha - 1, -alpha, not maximizing_player, ai, start_time, max_time)
+                if alpha < score < beta:
+                    score = -principal_variation_search(board, depth - 1, -beta, -score, not maximizing_player, ai, start_time, max_time)
+        except TimeoutError:
+            board.pop()
+            raise TimeoutError("Search timed out")
+        board.pop()
+
+        if score >= beta:
+            with transposition_table_lock:
+                ai.transposition_table[transposition_key] = {'value': beta, 'depth': depth}
+            return beta
+        if score > alpha:
+            alpha = score
+        first_child = False
+
+        # Check for timeout after each move
+        if time.time() - start_time >= max_time or ai.search_stop:
+            ai.search_stop = True
+            raise TimeoutError("Search timed out")
+
+    with transposition_table_lock:
+        ai.transposition_table[transposition_key] = {'value': alpha, 'depth': depth}
+    return alpha
+
+def quiescence_search(board: chess.Board, alpha: float, beta: float, ai: 'ChessAI', start_time: float, max_time: float) -> float:
+    """Extends the search at leaf nodes to capture sequences to avoid the horizon effect."""
+    # Check for timeout
+    if time.time() - start_time >= max_time or ai.search_stop:
+        ai.search_stop = True
+        raise TimeoutError("Search timed out")
+
+    stand_pat = evaluate_board(board, ai)
+    if stand_pat >= beta:
+        return beta
+    if alpha < stand_pat:
+        alpha = stand_pat
+
+    for move in ai.order_moves_quiescence(board):
+        board.push(move)
+        try:
+            score = -quiescence_search(board, -beta, -alpha, ai, start_time, max_time)
+        except TimeoutError:
+            board.pop()
+            raise TimeoutError("Search timed out")
+        board.pop()
+
+        if score >= beta:
+            return beta
+        if score > alpha:
+            alpha = score
+
+    return alpha
+
+def evaluate_board(board: chess.Board, ai: 'ChessAI') -> float:
+    """Evaluates the board using material balance and the neural network, with caching."""
+    board_hash = zobrist_hash(board)
+    with eval_cache_lock:
+        if board_hash in ai.eval_cache:
+            return ai.eval_cache[board_hash]
+
+    # Material evaluation
+    material_score = material_evaluation(board)
+
+    # Neural network evaluation
+    state = board_to_tensor_cached(board, ai)
+    with torch.no_grad():
+        _, value = ai.model(state)  # type: ignore
+        nn_eval = value.item()
+
+    # Clamp neural network evaluation between -10 and 10
+    nn_eval = max(min(nn_eval, MAX_EVAL), MIN_EVAL)
+
+    # Combine evaluations
+    eval_score = nn_eval + material_score
+    eval_score = max(min(eval_score, MAX_EVAL), MIN_EVAL)
+
+    # Cache the evaluation
+    with eval_cache_lock:
+        ai.eval_cache[board_hash] = eval_score
+
+    return eval_score
+
+# Cache for board tensor conversions
+board_tensor_cache = {}
+
+def board_to_tensor_cached(board: chess.Board, ai: 'ChessAI') -> torch.Tensor:
+    """Converts a chess board to a tensor representation with caching."""
+    board_hash = zobrist_hash(board)
+    with board_tensor_cache_lock:
+        if board_hash in board_tensor_cache:
+            return board_tensor_cache[board_hash]
+        tensor = board_to_tensor(board).unsqueeze(0).to(ai.device)
+        board_tensor_cache[board_hash] = tensor
+    return tensor
+
 class ChessNet(nn.Module):
     """Neural network model for evaluating chess positions."""
     def __init__(self):
         super(ChessNet, self).__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.conv_block = nn.Sequential(
-            nn.Conv2d(12, 256, kernel_size=3, padding=1),
+            nn.Conv2d(13, 256, kernel_size=3, padding=1),
             nn.BatchNorm2d(256),
             nn.ReLU()
         )
@@ -117,8 +240,7 @@ class ChessNet(nn.Module):
             nn.Flatten(),
             nn.Linear(1 * 8 * 8, 256),
             nn.ReLU(),
-            nn.Linear(256, 1),
-            nn.Tanh()
+            nn.Linear(256, 1)
         )
 
     def forward(self, x):
@@ -128,83 +250,18 @@ class ChessNet(nn.Module):
         value = self.value_head(x)
         return policy, value
 
-class MCTS:
-    def __init__(self, model, device):
-        self.model = model
-        self.device = device
-
-    def search(self, board, num_simulations=800):
-        root = Node(parent=None, prior_prob=1.0)
-        for _ in range(num_simulations):
-            node = root
-            state = board.copy()
-            # Selection
-            path = []
-            while node is not None and node.children:
-                action, node = node.select_child()
-                state.push(action)
-                path.append(node)
-            # Expansion
-            if not state.is_game_over():
-                policy, value = self.evaluate_state(state)
-                action_probs = []
-                for move in state.legal_moves:
-                    idx = move_to_index(move)
-                    prob = policy[idx]
-                    action_probs.append((move, prob))
-                if node is not None:
-                    node.expand(action_probs)
-            else:
-                # Game over
-                value = self.game_over_value(state)
-            # Backpropagation
-            self.backpropagate(node, value)
-        # Choose action with highest visit count
-        best_move = max(root.children.items(), key=lambda item: item[1].visit_count)[0]
-        policy = np.zeros(ACTION_SIZE)
-        for action, child in root.children.items():
-            idx = move_to_index(action)
-            policy[idx] = child.visit_count
-        policy = policy / np.sum(policy)
-        return best_move, policy
-
-    def evaluate_state(self, state):
-        state_tensor = board_to_tensor(state).unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            policy_logits, value = self.model(state_tensor)
-            policy = torch.softmax(policy_logits, dim=1).cpu().numpy()[0]
-        return policy, value.item()
-
-    def game_over_value(self, state):
-        # Returns +1, -1, or 0 for win, loss, or draw from current player's perspective
-        result = state.result()
-        if result == '1-0':
-            return 1 if state.turn == chess.WHITE else -1
-        elif result == '0-1':
-            return -1 if state.turn == chess.WHITE else 1
-        else:
-            return 0
-
-    def backpropagate(self, node, value):
-        while node is not None:
-            node.visit_count += 1
-            node.total_value += value
-            value = -value  # Switch perspectives
-            node = node.parent
-
-# Initialize the model globally and load weights
 def initialize_model(device: torch.device):
+    """Initializes the global model instance and loads pre-trained weights if available."""
     global model_instance
     model_instance = ChessNet()
     print(f"Using device: {device}")
-    print(torch.cuda.device_count())
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs")
         model_instance = nn.DataParallel(model_instance)
     model_instance.to(device)
     if os.path.exists(MODEL_PATH):
         try:
-            checkpoint = torch.load(MODEL_PATH, map_location=device)
+            checkpoint = torch.load(MODEL_PATH, map_location=device, weights_only=False)
             if isinstance(model_instance, nn.DataParallel):
                 model_instance.module.load_state_dict(checkpoint['model_state_dict'])
             else:
@@ -221,129 +278,121 @@ class ChessAI:
     def __init__(self, stockfish_path: str, device: torch.device):
         self.device = device
         self.stockfish = Stockfish(stockfish_path)
-        self.stockfish.set_skill_level(10)  # Default skill level
+        self.stockfish.set_skill_level(10)
+        self.stockfish.update_engine_parameters({
+            "Threads": 1,
+            "Minimum Thinking Time": 10,
+            "Hash": 16,
+            "UCI_LimitStrength": True,
+            "UCI_Elo": 1350
+        })
 
         # Initialize history and PV tables
         self.pv_table: Dict[str, chess.Move] = {}
         self.history_table: Dict[chess.Move, int] = defaultdict(int)
         self.model = model_instance
         self.transposition_table = {}
+        self.eval_cache = {}
+        self.killer_moves = [[] for _ in range(MAX_DEPTH)]
+        self.search_stop = False
+        self.max_workers = 4
 
-    def select_best_move(self, board: chess.Board, max_depth: int = 3) -> Optional[chess.Move]:
+    def get_stockfish_skill(self):
+        return self.stockfish.get_parameters()['Skill Level']
+
+    def select_best_move(self, board: chess.Board, max_time: float = MAX_TIME) -> Optional[chess.Move]:
+        """Selects the best move using iterative deepening and PVS within a time limit."""
+        return iterative_deepening(board, self, max_time)
+
+    def search(self, board: chess.Board, depth: int, start_time: float, max_time: float) -> Optional[chess.Move]:
+        """Searches for the best move at a given depth."""
         best_move = None
-        for depth in range(1, max_depth + 1):
-            current_best_move = self.iterative_deepening_search(board, depth)
-            if current_best_move:
-                best_move = current_best_move
-        return best_move
+        alpha = -float('inf')
+        beta = float('inf')
+        maximizing_player = board.turn == chess.WHITE
+        best_eval = -float('inf') if maximizing_player else float('inf')
+        moves = self.order_moves(board, depth)
+        if not moves:
+            return None
 
-    def iterative_deepening_search(self, board: chess.Board, depth: int) -> Optional[chess.Move]:
-        best_eval = -float('inf') if board.turn == chess.WHITE else float('inf')
-        best_move = None
+        for move in moves:
+            time_elapsed = time.time() - start_time
+            if time_elapsed >= max_time or self.search_stop:
+                self.search_stop = True
+                raise TimeoutError("Search timed out")
 
-        # Prioritize PV move if available
-        ordered_moves = []
-        board_fen = board.fen()
-        if board_fen in self.pv_table:
-            pv_move = self.pv_table[board_fen]
-            if pv_move in board.legal_moves:
-                ordered_moves = [pv_move] + [m for m in self.order_moves(board) if m != pv_move]
-        else:
-            ordered_moves = self.order_moves(board)
-
-        for move in ordered_moves:
             board.push(move)
-            eval_score = self.minimax_evaluate_helper(
-                board,
-                depth - 1,
-                -float('inf'),
-                float('inf'),
-                board.turn != chess.WHITE,
-                self.transposition_table
-            )
+            try:
+                eval = -principal_variation_search(board, depth - 1, -beta, -alpha, not maximizing_player, self, start_time, max_time)
+            except TimeoutError:
+                board.pop()
+                break
             board.pop()
 
-            if board.turn == chess.WHITE:
-                if eval_score > best_eval:
-                    best_eval = eval_score
+            if maximizing_player:
+                if eval > best_eval:
+                    best_eval = eval
                     best_move = move
+                alpha = max(alpha, eval)
             else:
-                if eval_score < best_eval:
-                    best_eval = eval_score
+                if eval < best_eval:
+                    best_eval = eval
                     best_move = move
+                beta = min(beta, eval)
 
-        if best_move:
-            # Update history and PV tables
-            self.history_table[best_move] += 1
-            self.pv_table[board_fen] = best_move
+            if beta <= alpha:
+                break
+
         return best_move
 
-    def minimax_evaluate_helper(
-        self,
-        board: chess.Board,
-        depth: int,
-        alpha: float,
-        beta: float,
-        is_maximizing: bool,
-        transposition_table: Dict[str, float]
-    ) -> float:
-        """Helper function for Minimax evaluation with alpha-beta pruning."""
-        board_fen = board.fen()
-        if board_fen in transposition_table:
-            return transposition_table[board_fen]
+    def order_moves(self, board: chess.Board, depth: int) -> list:
+        """Orders moves using the model's policy network and heuristics."""
+        state = board_to_tensor_cached(board, self)
+        with torch.no_grad():
+            policy_logits, _ = self.model(state)  # type: ignore
+            policy = torch.softmax(policy_logits, dim=1).cpu().numpy()[0]
 
-        if depth == 0 or board.is_game_over():
-            eval_score = cached_board_evaluation(board_fen)
-            transposition_table[board_fen] = eval_score
-            return eval_score
-
-        if is_maximizing:
-            max_eval = -float('inf')
-            for move in self.order_moves(board):
-                board.push(move)
-                eval_score = self.minimax_evaluate_helper(
-                    board, depth - 1, alpha, beta, False, transposition_table
-                )
-                board.pop()
-                max_eval = max(max_eval, eval_score)
-                alpha = max(alpha, eval_score)
-                if beta <= alpha:
-                    break
-            transposition_table[board_fen] = max_eval
-            return max_eval
-        else:
-            min_eval = float('inf')
-            for move in self.order_moves(board):
-                board.push(move)
-                eval_score = self.minimax_evaluate_helper(
-                    board, depth - 1, alpha, beta, True, transposition_table
-                )
-                board.pop()
-                min_eval = min(min_eval, eval_score)
-                beta = min(beta, eval_score)
-                if beta <= alpha:
-                    break
-            transposition_table[board_fen] = min_eval
-            return min_eval
-
-    def order_moves(self, board: chess.Board) -> list:
-        """Orders moves to improve alpha-beta pruning efficiency."""
-        ordered_moves = []
-        for move in board.legal_moves:
+        moves = list(board.legal_moves)
+        move_scores = []
+        for move in moves:
+            idx = move_to_index(move)
+            score = policy[idx]
+            # Add history heuristic
+            score += self.history_table.get(move, 0)
+            # Add killer move bonus
+            if move in self.killer_moves[depth]:
+                score += 10000
+            # Use MVV/LVA for captures
             if board.is_capture(move):
-                ordered_moves.insert(0, move)  # Prioritize captures
-            elif board.gives_check(move):
-                ordered_moves.insert(0, move)  # Prioritize checks
+                captured_piece = board.piece_at(move.to_square)
+                attacker_piece = board.piece_at(move.from_square)
+                if captured_piece and attacker_piece:
+                    mvv_lva_score = (captured_piece.piece_type * 10) - attacker_piece.piece_type
+                    score += mvv_lva_score
+            move_scores.append((move, score))
+
+        ordered_moves = [move for move, _ in sorted(move_scores, key=lambda x: x[1], reverse=True)]
+        return ordered_moves
+
+    def order_moves_quiescence(self, board: chess.Board) -> list:
+        """Orders moves for quiescence search (captures only)."""
+        moves = [move for move in board.legal_moves if board.is_capture(move)]
+        move_scores = []
+        for move in moves:
+            captured_piece = board.piece_at(move.to_square)
+            attacker_piece = board.piece_at(move.from_square)
+            if captured_piece and attacker_piece:
+                mvv_lva_score = (captured_piece.piece_type * 10) - attacker_piece.piece_type
+                move_scores.append((move, mvv_lva_score))
             else:
-                ordered_moves.append(move)
-        # Further prioritize based on history heuristic
-        ordered_moves.sort(key=lambda move: self.history_table.get(move, 0), reverse=True)
+                move_scores.append((move, 0))
+        ordered_moves = [move for move, _ in sorted(move_scores, key=lambda x: x[1], reverse=True)]
         return ordered_moves
 
     def save_model(self, optimizer=None, scheduler=None, loss_history=None, performance_history=None):
         """Saves the model and optimizer state to the specified path."""
         checkpoint = {
-            'model_state_dict': model_instance.module.state_dict() if isinstance(model_instance, nn.DataParallel) else model_instance.state_dict(), # type: ignore
+            'model_state_dict': model_instance.module.state_dict() if isinstance(model_instance, nn.DataParallel) else model_instance.state_dict(),  # type: ignore
             'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
             'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
             'loss_history': loss_history,
@@ -351,55 +400,114 @@ class ChessAI:
         }
         torch.save(checkpoint, MODEL_PATH)
         print(f"Model and state saved to {MODEL_PATH}")
+    
+    def periodically_save_model(self, optimizer=None, scheduler=None, loss_history=None, performance_history=None):
+        """Saves the model and optimizer state to the specified path."""
+        if not os.path.exists(BACKUP_MODEL_PATH):
+            os.makedirs(BACKUP_MODEL_PATH)
+        checkpoint = {
+            'model_state_dict': model_instance.module.state_dict() if isinstance(model_instance, nn.DataParallel) else model_instance.state_dict(),  # type: ignore
+            'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
+            'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+            'loss_history': loss_history,
+            'performance_history': performance_history,
+        }
+        save_path = os.path.join(BACKUP_MODEL_PATH, f"{time.time()}.pth")
+        torch.save(checkpoint, save_path)
+        print(f"Model and state saved to {BACKUP_MODEL_PATH+str(time.time())+'.pth'}")
 
-@lru_cache(maxsize=20000)
-def cached_board_evaluation(fen: str) -> float:
-    """Evaluates the board using the global neural network model."""
-    board = chess.Board(fen)
-    state = board_to_tensor(board).unsqueeze(0).to(model_instance.device) # type: ignore
-    with torch.no_grad():
-        _, value = model_instance(state) # type: ignore
-        eval_score = value.item()
-    return eval_score
+def material_evaluation(board: chess.Board) -> float:
+    """Calculates the material balance of the board."""
+    piece_values = {
+        chess.PAWN: 1,
+        chess.KNIGHT: 3,
+        chess.BISHOP: 3,
+        chess.ROOK: 5,
+        chess.QUEEN: 9,
+        chess.KING: 0
+    }
+    white_material = sum(len(board.pieces(pt, chess.WHITE)) * val for pt, val in piece_values.items())
+    black_material = sum(len(board.pieces(pt, chess.BLACK)) * val for pt, val in piece_values.items())
+    material_score = white_material - black_material
+    material_score /= 39
+    return material_score
 
 def board_to_tensor(board: chess.Board) -> torch.Tensor:
-    """Converts a chess board to a tensor representation."""
+    """Converts a chess board to a tensor representation with piece values."""
     piece_to_channel = {
-        'P': 0,  # White Pawn
-        'N': 1,  # White Knight
-        'B': 2,  # White Bishop
-        'R': 3,  # White Rook
-        'Q': 4,  # White Queen
-        'K': 5,  # White King
-        'p': 6,  # Black Pawn
-        'n': 7,  # Black Knight
-        'b': 8,  # Black Bishop
-        'r': 9,  # Black Rook
-        'q':10,  # Black Queen
-        'k':11   # Black King
+        'P': 0, 'N': 1, 'B': 2, 'R': 3, 'Q': 4, 'K': 5,
+        'p': 6, 'n': 7, 'b': 8, 'r': 9, 'q':10, 'k':11
+    }
+    piece_values = {
+        'P': 1, 'N': 3, 'B': 3, 'R': 5, 'Q': 9, 'K': 0,
+        'p': -1, 'n': -3, 'b': -3, 'r': -5, 'q': -9, 'k': 0
     }
     board_tensor = np.zeros((12, 8, 8), dtype=np.float32)
+    value_tensor = np.zeros((1, 8, 8), dtype=np.float32)
     for square in chess.SQUARES:
         piece = board.piece_at(square)
         if piece:
             piece_symbol = piece.symbol()
             channel = piece_to_channel[piece_symbol]
+            value = piece_values[piece_symbol]
             x = square % 8
             y = 7 - (square // 8)
             board_tensor[channel, y, x] = 1
-    return torch.tensor(board_tensor, dtype=torch.float32)
+            value_tensor[0, y, x] = value
+    combined_tensor = np.concatenate((board_tensor, value_tensor), axis=0)
+    return torch.tensor(combined_tensor, dtype=torch.float32)
 
-def periodic_evaluation(ai: ChessAI, episodes: int = 5, skill_level: int = 10):
-    """Evaluate the AI's performance against Stockfish."""
+def move_to_index(move: chess.Move) -> int:
+    """Converts a move to an index in the policy output."""
+    NUM_SQUARES = 64
+    NUM_PROMOTION_PIECES = 4
+    from_square = move.from_square
+    to_square = move.to_square
+    promotion = move.promotion
+
+    if promotion is None:
+        index = from_square * NUM_SQUARES + to_square
+    else:
+        promotion_index = {chess.QUEEN: 0, chess.ROOK: 1, chess.BISHOP: 2, chess.KNIGHT: 3}[promotion]
+        index = NUM_SQUARES * NUM_SQUARES + (from_square - 8) * NUM_PROMOTION_PIECES + promotion_index
+    return index
+
+def index_to_move(idx: int, board: chess.Board) -> Optional[chess.Move]:
+    """Converts an index in the policy output to a move."""
+    NUM_SQUARES = 64
+    NUM_PROMOTION_PIECES = 4
+
+    if idx < NUM_SQUARES * NUM_SQUARES:
+        from_square = idx // NUM_SQUARES
+        to_square = idx % NUM_SQUARES
+        move = chess.Move(from_square, to_square)
+    else:
+        idx -= NUM_SQUARES * NUM_SQUARES
+        from_square = idx // NUM_PROMOTION_PIECES + 8
+        promotion_index = idx % NUM_PROMOTION_PIECES
+        promotion_piece = [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT][promotion_index]
+        to_square = from_square + 8 if board.turn == chess.WHITE else from_square - 8
+        move = chess.Move(from_square, to_square, promotion=promotion_piece)
+
+    if move in board.legal_moves:
+        return move
+    else:
+        return None
+
+def periodic_evaluation(ai: ChessAI, episodes: int = 3, skill_level: int = 10):
+    """Evaluate the AI's performance against Stockfish and collect game data for training."""
     stockfish = ai.stockfish
     stockfish.set_skill_level(skill_level)
     device = ai.device
     ai.model = model_instance
-    ai.model.eval() # type: ignore
+    ai.model.eval()  # type: ignore
 
     win_count = 0
     draw_count = 0
     loss_count = 0
+
+    # Initialize a list to store training data
+    evaluation_memory = []
 
     for _ in range(episodes):
         board = chess.Board()
@@ -407,10 +515,31 @@ def periodic_evaluation(ai: ChessAI, episodes: int = 5, skill_level: int = 10):
         while not board.is_game_over():
             if board.turn == chess.WHITE:
                 # AI's move
-                best_move = ai.select_best_move(board, max_depth=3)
+                best_move = ai.select_best_move(board)
                 if best_move is None:
                     best_move = random.choice(list(board.legal_moves))
                 board.push(best_move)
+
+                # Collect data
+                state = board_to_tensor(board).unsqueeze(0)
+                # Get Stockfish evaluation
+                stockfish.set_fen_position(board.fen())
+                stockfish_eval = stockfish.get_evaluation()
+                if stockfish_eval['type'] == 'cp':
+                    stockfish_value = stockfish_eval['value'] / 100.0
+                elif stockfish_eval['type'] == 'mate':
+                    stockfish_value = np.sign(stockfish_eval['value']) * 10.0
+                else:
+                    stockfish_value = 0.0
+                # Adjust evaluation from the AI's perspective
+                stockfish_value = max(min(stockfish_value, MAX_EVAL), MIN_EVAL)
+                target_eval = torch.tensor([stockfish_value], dtype=torch.float32)
+
+                # Store the experience
+                evaluation_memory.append((state, target_eval))
+
+                if board.is_game_over():
+                    break
             else:
                 # Stockfish's move
                 stockfish.set_fen_position(board.fen())
@@ -419,6 +548,28 @@ def periodic_evaluation(ai: ChessAI, episodes: int = 5, skill_level: int = 10):
                     stockfish_move_obj = chess.Move.from_uci(stockfish_move)
                     board.push(stockfish_move_obj)
                 else:
+                    break
+
+                # Collect data
+                state = board_to_tensor(board).unsqueeze(0)
+                # Get Stockfish evaluation
+                stockfish.set_fen_position(board.fen())
+                stockfish_eval = stockfish.get_evaluation()
+                if stockfish_eval['type'] == 'cp':
+                    stockfish_value = stockfish_eval['value'] / 100.0
+                elif stockfish_eval['type'] == 'mate':
+                    stockfish_value = np.sign(stockfish_eval['value']) * 10.0
+                else:
+                    stockfish_value = 0.0
+                # Adjust evaluation from the AI's perspective (since it's the opponent's move)
+                stockfish_value = -stockfish_value
+                stockfish_value = max(min(stockfish_value, MAX_EVAL), MIN_EVAL)
+                target_eval = torch.tensor([stockfish_value], dtype=torch.float32)
+
+                # Store the experience
+                evaluation_memory.append((state, target_eval))
+
+                if board.is_game_over():
                     break
 
         # Determine game outcome
@@ -434,215 +585,292 @@ def periodic_evaluation(ai: ChessAI, episodes: int = 5, skill_level: int = 10):
     print(f"Evaluation against Stockfish (Skill Level {skill_level}):")
     print(f"Wins: {win_count}, Losses: {loss_count}, Draws: {draw_count}")
 
-    return win_count, draw_count, loss_count
+    ai.transposition_table.clear()
+    ai.pv_table.clear()
+    ai.history_table.clear()
 
-def move_to_index(move: chess.Move) -> int:
-    """Converts a move to an index in the policy output."""
-    # Initialize constants
-    NUM_SQUARES = 64
-    NUM_PROMOTION_PIECES = 4  # Queen, Rook, Bishop, Knight
+    return win_count, draw_count, loss_count, evaluation_memory
 
-    from_square = move.from_square
-    to_square = move.to_square
-    promotion = move.promotion
+#region TRAINING
 
-    if promotion is None:
-        # Normal move
-        index = from_square * NUM_SQUARES + to_square
-    else:
-        # Promotion move
-        promotion_index = {chess.QUEEN: 0, chess.ROOK: 1, chess.BISHOP: 2, chess.KNIGHT: 3}[promotion]
-        index = NUM_SQUARES * NUM_SQUARES + (from_square - 8) * NUM_PROMOTION_PIECES + promotion_index
-    return index
-
-def index_to_move(idx: int, board: chess.Board) -> Optional[chess.Move]:
-    """Converts an index in the policy output to a move."""
-    NUM_SQUARES = 64
-    NUM_PROMOTION_PIECES = 4  # Queen, Rook, Bishop, Knight
-
-    if idx < NUM_SQUARES * NUM_SQUARES:
-        from_square = idx // NUM_SQUARES
-        to_square = idx % NUM_SQUARES
-        move = chess.Move(from_square, to_square)
-    else:
-        idx -= NUM_SQUARES * NUM_SQUARES
-        from_square = idx // NUM_PROMOTION_PIECES + 8
-        promotion_index = idx % NUM_PROMOTION_PIECES
-        promotion_piece = [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT][promotion_index]
-        # For promotion, to_square is one rank ahead for pawns
-        to_square = from_square + 8 if board.turn == chess.WHITE else from_square - 8
-        move = chess.Move(from_square, to_square, promotion=promotion_piece)
-
-    if move in board.legal_moves:
-        return move
-    else:
-        return None
+INITIAL_EPISODES = 0
 
 def train(
     ai: ChessAI,
     episodes: int = 1000,
-    lr: float = 0.0001,  # Reduced learning rate
+    lr: float = 0.00001,
     stop_event: Optional[threading.Event] = None,
     current_loss: Optional[list] = None,
     current_episode: Optional[list] = None,
-    evaluation_interval: int = 100,
-    batch_size: int = 32,
-    buffer_size: int = 10000,
-    loss_history: Optional[list] = None,       # New parameter
-    performance_history: Optional[list] = None  # New parameter
+    evaluation_interval: int = 25,
+    batch_size: int = 128,
+    buffer_size: int = 50000,
+    loss_history: Optional[list] = None,
+    performance_history: Optional[list] = None
 ):
-    """Trains the neural network using experience replay."""
+    """Trains the neural network using experience replay with Mixed Precision."""
     device = ai.device
-    model = model_instance  # Use the global model
-    model.to(device) # type: ignore
-    stockfish = ai.stockfish
-    stockfish.set_skill_level(20)
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5) # type: ignore
+    model = model_instance.to(device) # type: ignore
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     criterion = nn.SmoothL1Loss()
-
-    # Learning rate scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=10) # type: ignore
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=10)
     loss_history = [] if loss_history is None else loss_history
     performance_history = [] if performance_history is None else performance_history
-    epsilon_start = None
+    
+    scaler = GradScaler('cuda')  # Initialize GradScaler for AMP
+
+    replay_buffer = deque(maxlen=buffer_size)
+
+    stockfish = ai.stockfish
+    stockfish_skill = 1
+    # Limit Stockfish search depth for faster evaluation
+    stockfish.update_engine_parameters({
+        "Threads": 3,
+        "Minimum Thinking Time": 5,
+        "Hash": 16,
+        "UCI_LimitStrength": True,
+        "UCI_Elo": 1350  # Adjust as needed
+    })
+    stockfish.set_skill_level(stockfish_skill)
+    criterion = nn.SmoothL1Loss()
+    start_episode = 0
 
     # Load optimizer and scheduler state if available
     if os.path.exists(MODEL_PATH):
-        checkpoint = torch.load(MODEL_PATH, map_location=device)
+        checkpoint = torch.load(MODEL_PATH, map_location=device, weights_only=False)
         if 'optimizer_state_dict' in checkpoint and checkpoint['optimizer_state_dict'] is not None:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             print("Optimizer state loaded.")
         if 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict'] is not None:
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             print("Scheduler state loaded.")
-        # Load transposition_table and history_table if needed
-        if 'transposition_table' in checkpoint:
-            ai.transposition_table = {}
-            for fen, entry in checkpoint['transposition_table'].items():
-                if isinstance(entry, TranspositionEntry):
-                    ai.transposition_table[fen] = entry.eval
-                else:
-                    ai.transposition_table[fen] = entry  # Assuming it's already a float
-            print("Transposition table loaded and converted.")
-        if 'history_table' in checkpoint:
-            ai.history_table = checkpoint['history_table']
-            print("History table loaded.")
+        # Load other necessary states if needed
         if 'loss_history' in checkpoint and checkpoint['loss_history'] is not None:
             loss_history.extend(checkpoint['loss_history'])
         if 'performance_history' in checkpoint and checkpoint['performance_history'] is not None:
             performance_history.extend(checkpoint['performance_history'])
-    if os.path.exists("epsilon_start.txt"):
-        with open("epsilon_start.txt", "r") as f:
-            epsilon_start = float(f.read().strip())
+        start_episode = len(loss_history)
+        print(f"Resuming training from episode {start_episode + 1}.")
+    else:
+        print("Starting training from scratch.")
+    if os.path.exists("stockfish_skill.txt"):
+        with open("stockfish_skill.txt", "r") as f:
+            stockfish_skill = int(f.read().strip())
+        stockfish.set_skill_level(stockfish_skill)
 
-    # Replay buffer for experience replay
-    replay_buffer = deque(maxlen=buffer_size)
+    # Cache for Stockfish evaluations
+    stockfish_eval_cache = {}
+    
+    INITIAL_EPISODES = start_episode
 
-    # Epsilon decay parameters
-    epsilon = 1.0
-    if epsilon_start is None:
-        epsilon_start = 1.0
-    epsilon_end = 0.1
-    epsilon_decay = 0.995
-
-    # Normalization parameters
-    MIN_EVAL = -10.0  # Defined min evaluation
-    MAX_EVAL = 10.0   # Defined max evaluation
-
-    for episode in range(episodes):
+    for episode in range(start_episode, episodes+start_episode):
+        if (episode + 1) % 150 == 0:
+            if stockfish_skill < 20:
+                stockfish_skill += 1
+        stockfish.set_skill_level(stockfish_skill)
         time_start = time.perf_counter()
-        epsilon = max(epsilon_end, epsilon_start * (epsilon_decay ** episode))
 
         if stop_event is not None and stop_event.is_set():
             ai.save_model(optimizer, scheduler, loss_history, performance_history)
-            with open("epsilon_start.txt", "w") as f:
-                f.write(str(epsilon))
+            with open("stockfish_skill.txt", "w") as f:
+                f.write(str(stockfish_skill))
             print(f"Training stopped by user. Model saved to {MODEL_PATH}")
             return
+        
+        if (episode + 1) % evaluation_interval == 0:
+            ai.periodically_save_model(optimizer, scheduler, loss_history, performance_history)
+            print('Model saved for backup purposes.')
+            print(f"\n--- Evaluating after {episode + 1} episodes ---")
+            win, draw, loss_result, evaluation_memory = periodic_evaluation(ai, episodes=3, skill_level=stockfish_skill)
+            if performance_history is not None:
+                performance_history.append((win, draw, loss_result))
+            else:
+                print("performance_history is None")
 
-        board = chess.Board()
+            # Add evaluation data to replay buffer
+            replay_buffer.extend(evaluation_memory)
+
+            # Training step
+            if len(replay_buffer) >= batch_size:
+                batch = random.sample(replay_buffer, batch_size)
+                states, targets = zip(*batch)
+                states = torch.cat(states).to(device)
+                targets = torch.stack([t.to(device) for t in targets])
+
+                optimizer.zero_grad()
+                with autocast('cuda'):  # Enable autocast for mixed precision
+                    _, outputs = model(states)
+                    loss = criterion(outputs, targets)
+                scaler.scale(loss).backward()  # Scale loss for backprop
+                scaler.step(optimizer)          # Step optimizer
+                scaler.update()                 # Update scaler
+
+                scheduler.step(loss)
+
+                if current_loss is not None:
+                    current_loss[0] = loss.item()
+                    if loss_history is not None:
+                        loss_history.append(loss.item())
+            else:
+                loss = None  # If not enough samples, set loss to None
+
+            if current_episode is not None:
+                current_episode[0] = episode + 1
+
+            end_time = time.perf_counter()
+
+            if loss is not None:
+                print(f"Periodic Evaluation Episode {episode + 1}/{start_episode + episodes} - Loss: {loss.item():.4f} - Time: {end_time - time_start:.2f}s")
+            else:
+                print(f"Episode {episode + 1}/{start_episode + episodes} - Loss: N/A - Time: {end_time - time_start:.2f}s")
+            continue
+
         episode_memory = []
+        while len(episode_memory) < batch_size:
+            board = chess.Board()
+            while not board.is_game_over():
+                # Stockfish's move (White)
+                stockfish.set_fen_position(board.fen())
+                stockfish_move = stockfish.get_best_move()
+                if stockfish_move:
+                    move = chess.Move.from_uci(stockfish_move)
+                else:
+                    move = random.choice(list(board.legal_moves))
+                board.push(move)
 
-        while not board.is_game_over():
-            state = board_to_tensor(board).unsqueeze(0).to(device)
+                # Get evaluation after the move
+                fen = board.fen()
+                if fen in stockfish_eval_cache and 'evaluation' in stockfish_eval_cache[fen]:
+                    stockfish_value = stockfish_eval_cache[fen]['evaluation']
+                else:
+                    stockfish.set_fen_position(fen)
+                    stockfish_eval = stockfish.get_evaluation()
+                    if stockfish_eval['type'] == 'cp':
+                        stockfish_value = stockfish_eval['value'] / 100.0
+                    elif stockfish_eval['type'] == 'mate':
+                        stockfish_value = np.sign(stockfish_eval['value']) * 10.0
+                    else:
+                        stockfish_value = 0.0
+                    stockfish_value = max(min(stockfish_value, MAX_EVAL), MIN_EVAL)
+                    stockfish_eval_cache[fen] = {'evaluation': stockfish_value}
 
-            # Select move (epsilon-greedy strategy)
-            if random.uniform(0, 1) < epsilon:
-                chosen_move = random.choice(list(board.legal_moves))
-            else:
-                chosen_move = ai.select_best_move(board, max_depth=3)  # Adjust depth as needed
-                if chosen_move is None:
-                    chosen_move = random.choice(list(board.legal_moves))
-            board.push(chosen_move)
+                # Adjust evaluation to be from current player's perspective
+                if board.turn == chess.BLACK:
+                    stockfish_value = -stockfish_value
 
-            # Stockfish evaluation of the new board state
-            stockfish.set_fen_position(board.fen())
-            stockfish_eval = stockfish.get_evaluation()
-            if stockfish_eval['type'] == 'cp':
-                stockfish_value = stockfish_eval['value'] / 100.0
-            elif stockfish_eval['type'] == 'mate':
-                stockfish_value = np.sign(stockfish_eval['value']) * 10.0
-            else:
-                stockfish_value = 0.0
+                # Normalize and combine evaluations
+                stockfish_value = max(min(stockfish_value, MAX_EVAL), MIN_EVAL)
 
-            stockfish_value = max(min(stockfish_value, MAX_EVAL), MIN_EVAL)
-            normalized_value = (stockfish_value - MIN_EVAL) / (MAX_EVAL - MIN_EVAL) * 2 - 1
-            target_eval = torch.tensor([normalized_value], dtype=torch.float32).to(device)
+                # Add material evaluation (already normalized between -1 and 1)
+                material_score = material_evaluation(board)
+                combined_value = stockfish_value + material_score
 
-            # Store the experience
-            episode_memory.append((state, target_eval))
+                # Clamp the combined value to ensure it stays within [-10, 10]
+                combined_value = max(min(combined_value, MAX_EVAL), MIN_EVAL)
+                target_eval = torch.tensor([combined_value], dtype=torch.float32).to(device)
 
-        replay_buffer.extend(episode_memory)
-        loss = None
+                # Store the experience
+                episode_memory.append((board_to_tensor(board).unsqueeze(0), target_eval))
+
+                if board.is_game_over() or len(episode_memory) >= batch_size:
+                    break
+
+                # Stockfish's move (Black)
+                stockfish.set_fen_position(board.fen())
+                stockfish_move = stockfish.get_best_move()
+                if stockfish_move:
+                    move = chess.Move.from_uci(stockfish_move)
+                else:
+                    move = random.choice(list(board.legal_moves))
+                board.push(move)
+
+                # Get evaluation after the move
+                fen = board.fen()
+                if fen in stockfish_eval_cache and 'evaluation' in stockfish_eval_cache[fen]:
+                    stockfish_value = stockfish_eval_cache[fen]['evaluation']
+                else:
+                    stockfish.set_fen_position(fen)
+                    stockfish_eval = stockfish.get_evaluation()
+                    if stockfish_eval['type'] == 'cp':
+                        stockfish_value = stockfish_eval['value'] / 100.0
+                    elif stockfish_eval['type'] == 'mate':
+                        stockfish_value = np.sign(stockfish_eval['value']) * 10.0
+                    else:
+                        stockfish_value = 0.0
+                    stockfish_value = max(min(stockfish_value, MAX_EVAL), MIN_EVAL)
+                    stockfish_eval_cache[fen] = {'evaluation': stockfish_value}
+
+                # Adjust evaluation to be from current player's perspective
+                if board.turn == chess.WHITE:
+                    stockfish_value = -stockfish_value
+
+                # Normalize and combine evaluations
+                stockfish_value = max(min(stockfish_value, MAX_EVAL), MIN_EVAL)
+
+                # Add material evaluation
+                material_score = material_evaluation(board)
+                combined_value = stockfish_value + material_score
+
+                # Clamp the combined value
+                combined_value = max(min(combined_value, MAX_EVAL), MIN_EVAL)
+                target_eval = torch.tensor([combined_value], dtype=torch.float32).to(device)
+
+                # Store the experience
+                episode_memory.append((board_to_tensor(board).unsqueeze(0), target_eval))
+
+                if board.is_game_over() or len(episode_memory) >= batch_size:
+                    break
+
+            # Extend the replay buffer with the episode memory
+            replay_buffer.extend(episode_memory)
+
+        # Training step
         if len(replay_buffer) >= batch_size:
             batch = random.sample(replay_buffer, batch_size)
             states, targets = zip(*batch)
-            states = torch.cat(states)
-            targets = torch.stack(targets)
-
-            model.train().to(device) # type: ignore
+            states = torch.cat(states).to(device)
+            targets = torch.stack([t.to(device) for t in targets])
+            
             optimizer.zero_grad()
-            _, outputs = model(states.to(device)) # type: ignore
-            loss = criterion(outputs, targets.to(device))
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # type: ignore
-            optimizer.step()
-
+            with autocast('cuda'):  # Enable autocast for mixed precision
+                _, outputs = model(states)
+                loss = criterion(outputs, targets)
+            scaler.scale(loss).backward()  # Scale loss for backprop
+            scaler.step(optimizer)          # Step optimizer
+            scaler.update()                 # Update scaler
+            
             scheduler.step(loss)
-
+            
             if current_loss is not None:
                 current_loss[0] = loss.item()
                 if loss_history is not None:
                     loss_history.append(loss.item())
+        else:
+            loss = None  # If not enough samples, set loss to None
 
         if current_episode is not None:
             current_episode[0] = episode + 1
 
-        # Periodic evaluation
-        if (episode + 1) % evaluation_interval == 0:
-            print(f"\n--- Evaluating after {episode + 1} episodes ---")
-            win, draw, loss_result = periodic_evaluation(ai, episodes=5, skill_level=10)
-            if performance_history is not None:
-                performance_history.append((win, draw, loss_result))
-
         end_time = time.perf_counter()
-        
+
         if loss is not None:
-            print(f"Episode {episode + 1}/{episodes} - Loss: {loss.item():.4f} - Time: {end_time - time_start:.2f}s")
+            print(f"Episode {episode + 1}/{episodes + start_episode} - Loss: {loss.item():.4f} - Time: {end_time - time_start:.2f}s")
         else:
-            print(f"Episode {episode + 1}/{episodes} - Loss: N/A - Time: {end_time - time_start:.2f}s")
+            print(f"Episode {episode + 1}/{episodes + start_episode} - Loss: N/A - Time: {end_time - time_start:.2f}s")
 
     ai.save_model(optimizer, scheduler, loss_history, performance_history)
-    with open("epsilon_start.txt", "w") as f:
-        f.write(str(epsilon))
+    with open("stockfish_skill.txt", "w") as f:
+        f.write(str(stockfish_skill))
     print("Training completed and model saved.")
+
+#endregion
 
 def play_against_stockfish(ai: ChessAI, skill_level: int = 10):
     """Launches a GUI for playing against Stockfish."""
     device = ai.device
     model = model_instance  # Use the global model
-    model.to(device) # type: ignore
-    model.eval() # type: ignore
+    model.to(device)  # type: ignore
+    model.eval()  # type: ignore
 
     game_window = tk.Toplevel()
     game_window.title("Chess AI vs Stockfish")
@@ -660,7 +888,7 @@ def play_against_stockfish(ai: ChessAI, skill_level: int = 10):
     # Load piece images
     piece_images = {}
     pieces = ['P', 'N', 'B', 'R', 'Q', 'K',
-                'p', 'n', 'b', 'r', 'q', 'k']
+              'p', 'n', 'b', 'r', 'q', 'k']
     for piece in pieces:
         if piece.isupper():
             filename = os.path.join(IMAGE_DIR, f"{piece}.png")
@@ -688,6 +916,9 @@ def play_against_stockfish(ai: ChessAI, skill_level: int = 10):
 
     stockfish_eval_label = tk.Label(info_frame, text="Stockfish Evaluation: N/A")
     stockfish_eval_label.pack()
+    
+    ai_eval_label = tk.Label(info_frame, text="AI Evaluation: N/A")
+    ai_eval_label.pack()
 
     # Resume Game button
     def resume_game():
@@ -709,6 +940,7 @@ def play_against_stockfish(ai: ChessAI, skill_level: int = 10):
         move_list.insert('end', "Move List\nAI vs Stockfish\n")
         update_board()
         stockfish_eval_label.config(text="Stockfish Evaluation: N/A")
+        ai_eval_label.config(text="AI Evaluation: N/A")
 
     resume_button = tk.Button(info_frame, text="Resume Game", command=resume_game)
     resume_button.pack()
@@ -751,7 +983,7 @@ def play_against_stockfish(ai: ChessAI, skill_level: int = 10):
         stockfish_value = 0.0
         if board.turn == chess.WHITE:
             # AI's move
-            chosen_move = ai.select_best_move(board, max_depth=3)  # Adjust depth as needed
+            chosen_move = ai.select_best_move(board)  # Adjust depth as needed
             if chosen_move is None:
                 chosen_move = random.choice(list(board.legal_moves))
             move_san = board.san(chosen_move)  # Get SAN before pushing the move
@@ -763,11 +995,8 @@ def play_against_stockfish(ai: ChessAI, skill_level: int = 10):
             # Model evaluation
             state = board_to_tensor(board).unsqueeze(0).to(device)
             with torch.no_grad():
-                if model_instance is not None:
-                    _, value = model_instance(state)
-                    model_eval = value.item()
-                else:
-                    model_eval = 0.0  # Default value or handle the error appropriately
+                _, value = model_instance(state)  # type: ignore
+                model_eval = max(min(value.item(), MAX_EVAL), MIN_EVAL)
 
             # Stockfish evaluation
             ai.stockfish.set_fen_position(board.fen())
@@ -778,6 +1007,9 @@ def play_against_stockfish(ai: ChessAI, skill_level: int = 10):
                 stockfish_value = np.sign(stockfish_eval['value']) * 10.0
             else:
                 stockfish_value = 0.0
+
+            # Clamp stockfish_value
+            stockfish_value = max(min(stockfish_value, MAX_EVAL), MIN_EVAL)
             evaluations.append((model_eval, stockfish_value))
 
             # Update move list
@@ -815,7 +1047,7 @@ def play_against_stockfish(ai: ChessAI, skill_level: int = 10):
                 # Model evaluation
                 state = board_to_tensor(board).unsqueeze(0).to(device)
                 with torch.no_grad():
-                    _, value = model_instance(state) # type: ignore
+                    _, value = model_instance(state)  # type: ignore
                     model_eval = value.item()
 
                 # Stockfish evaluation
@@ -854,6 +1086,7 @@ def play_against_stockfish(ai: ChessAI, skill_level: int = 10):
 
         # Update evaluations labels
         stockfish_eval_label.config(text=f"Stockfish Evaluation: {stockfish_value:.2f}")
+        ai_eval_label.config(text=f"AI Evaluation: {model_eval:.4f}")
 
         # Update board display
         update_board()
@@ -874,6 +1107,7 @@ def play_against_stockfish(ai: ChessAI, skill_level: int = 10):
         if move_index < len(evaluations):
             model_eval, stockfish_value = evaluations[move_index]
             stockfish_eval_label.config(text=f"Stockfish Evaluation: {stockfish_value:.2f}")
+            ai_eval_label.config(text=f"AI Evaluation: {model_eval:.4f}")
 
     def auto_play():
         """Automates the play by alternating moves between AI and Stockfish."""
@@ -992,13 +1226,13 @@ def main():
             args=(
                 ai,
                 episodes,
-                0.0001,  # Updated learning rate
+                0.001,  # Updated learning rate
                 stop_event,
                 current_loss,
                 current_episode,
                 100,  # evaluation_interval
-                32,   # batch_size
-                10000, # buffer_size
+                64,   # batch_size
+                50000, # buffer_size
                 loss_history,       # Pass loss_history
                 performance_history  # Pass performance_history
             )
@@ -1053,6 +1287,9 @@ def main():
     
     device_label = tk.Label(control_frame, text=f"Device: {device}")
     device_label.grid(row=3, column=0, padx=5, pady=5)
+    
+    training_diff_label = tk.Label(control_frame, text="Training Difficulty: N/A")
+    training_diff_label.grid(row=3, column=1, padx=5, pady=5)
 
     # Setup Matplotlib Figures
     fig_loss, ax_loss = plt.subplots(figsize=(5, 4))
@@ -1139,11 +1376,12 @@ def main():
     # Function to update GUI elements
     def update_gui():
         loss_label.config(text=f"Current Loss: {current_loss[0]:.4f}")
-        episode_label.config(text=f"Current Episode: {current_episode[0]}")
+        episode_label.config(text=f"Current Episode: {current_episode[0] + INITIAL_EPISODES+1}")
         cpu_usage = psutil.cpu_percent()
         memory_usage = psutil.virtual_memory().percent
         cpu_label.config(text=f"CPU Usage: {cpu_usage}%")
         memory_label.config(text=f"Memory Usage: {memory_usage}%")
+        training_diff_label.config(text=f"Training Difficulty: {ai.get_stockfish_skill()}")  
 
         # Update plots
         update_plots()

@@ -10,3 +10,4 @@ chess_model.pth
 old_pth/
 dist/play.exe
 epsilon_start.txt
+stockfish_skill.txt

@@ -10,6 +10,7 @@ from tracemalloc import start
 from typing import Dict, Optional
 
 import chess
+from keyboard import replay
 import numpy as np
 import psutil
 import torch
@@ -280,11 +281,11 @@ class ChessAI:
         self.stockfish = Stockfish(stockfish_path)
         self.stockfish.set_skill_level(10)
         self.stockfish.update_engine_parameters({
-            "Threads": 1,
-            "Minimum Thinking Time": 10,
+            "Threads": 3,
+            "Minimum Thinking Time": 5,
             "Hash": 16,
             "UCI_LimitStrength": True,
-            "UCI_Elo": 1350
+            "UCI_Elo": 1350  # Adjust as needed
         })
 
         # Initialize history and PV tables
@@ -389,28 +390,31 @@ class ChessAI:
         ordered_moves = [move for move, _ in sorted(move_scores, key=lambda x: x[1], reverse=True)]
         return ordered_moves
 
-    def save_model(self, optimizer=None, scheduler=None, loss_history=None, performance_history=None):
-        """Saves the model and optimizer state to the specified path."""
+    def save_model(self, optimizer=None, scheduler=None, loss_history=None, performance_history=None, replay_buffer=None):
+        """Saves the model, optimizer state, and replay buffer to the specified path."""
         checkpoint = {
-            'model_state_dict': model_instance.module.state_dict() if isinstance(model_instance, nn.DataParallel) else model_instance.state_dict(),  # type: ignore
+            'model_state_dict': model_instance.module.state_dict() if isinstance(model_instance, nn.DataParallel) else model_instance.state_dict(), # type: ignore
             'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
             'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
             'loss_history': loss_history,
             'performance_history': performance_history,
+            'replay_buffer': list(replay_buffer) if replay_buffer else None,
         }
         torch.save(checkpoint, MODEL_PATH)
         print(f"Model and state saved to {MODEL_PATH}")
+
     
-    def periodically_save_model(self, optimizer=None, scheduler=None, loss_history=None, performance_history=None):
+    def periodically_save_model(self, optimizer=None, scheduler=None, loss_history=None, performance_history=None, replay_buffer=None):
         """Saves the model and optimizer state to the specified path."""
         if not os.path.exists(BACKUP_MODEL_PATH):
             os.makedirs(BACKUP_MODEL_PATH)
         checkpoint = {
-            'model_state_dict': model_instance.module.state_dict() if isinstance(model_instance, nn.DataParallel) else model_instance.state_dict(),  # type: ignore
+            'model_state_dict': model_instance.module.state_dict() if isinstance(model_instance, nn.DataParallel) else model_instance.state_dict(), # type: ignore
             'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
             'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
             'loss_history': loss_history,
             'performance_history': performance_history,
+            'replay_buffer': list(replay_buffer) if replay_buffer else None,
         }
         save_path = os.path.join(BACKUP_MODEL_PATH, f"{time.time()}.pth")
         torch.save(checkpoint, save_path)
@@ -649,6 +653,8 @@ def train(
             loss_history.extend(checkpoint['loss_history'])
         if 'performance_history' in checkpoint and checkpoint['performance_history'] is not None:
             performance_history.extend(checkpoint['performance_history'])
+        if 'replay_buffer' in checkpoint and checkpoint['replay_buffer'] is not None:
+            replay_buffer.extend(checkpoint['replay_buffer'])
         start_episode = len(loss_history)
         print(f"Resuming training from episode {start_episode + 1}.")
     else:
@@ -671,14 +677,14 @@ def train(
         time_start = time.perf_counter()
 
         if stop_event is not None and stop_event.is_set():
-            ai.save_model(optimizer, scheduler, loss_history, performance_history)
+            ai.save_model(optimizer, scheduler, loss_history, performance_history, replay_buffer)
             with open("stockfish_skill.txt", "w") as f:
                 f.write(str(stockfish_skill))
             print(f"Training stopped by user. Model saved to {MODEL_PATH}")
             return
         
         if (episode + 1) % evaluation_interval == 0:
-            ai.periodically_save_model(optimizer, scheduler, loss_history, performance_history)
+            ai.periodically_save_model(optimizer, scheduler, loss_history, performance_history, replay_buffer)
             print('Model saved for backup purposes.')
             print(f"\n--- Evaluating after {episode + 1} episodes ---")
             win, draw, loss_result, evaluation_memory = periodic_evaluation(ai, episodes=3, skill_level=stockfish_skill)
@@ -858,7 +864,7 @@ def train(
         else:
             print(f"Episode {episode + 1}/{episodes + start_episode} - Loss: N/A - Time: {end_time - time_start:.2f}s")
 
-    ai.save_model(optimizer, scheduler, loss_history, performance_history)
+    ai.save_model(optimizer, scheduler, loss_history, performance_history, replay_buffer)
     with open("stockfish_skill.txt", "w") as f:
         f.write(str(stockfish_skill))
     print("Training completed and model saved.")
@@ -888,7 +894,7 @@ def play_against_stockfish(ai: ChessAI, skill_level: int = 10):
     # Load piece images
     piece_images = {}
     pieces = ['P', 'N', 'B', 'R', 'Q', 'K',
-              'p', 'n', 'b', 'r', 'q', 'k']
+                'p', 'n', 'b', 'r', 'q', 'k']
     for piece in pieces:
         if piece.isupper():
             filename = os.path.join(IMAGE_DIR, f"{piece}.png")
@@ -1143,6 +1149,278 @@ def exit_program(root: tk.Tk, stop_event: threading.Event, training_thread: Opti
     root.destroy()
     sys.exit()
 
+def play_against_model(ai: ChessAI):
+    """Allows the user to play against the AI model."""
+    device = ai.device
+    model = model_instance  # Use the global model
+    model.to(device)  # type: ignore
+    model.eval()  # type: ignore
+
+    game_window = tk.Toplevel()
+    game_window.title("Play Against AI Model")
+
+    # Initialize necessary variables
+    board = chess.Board()
+    board.turn = chess.WHITE
+
+    # Initialize move number, moves, evaluations, and board positions
+    move_number = 1
+    moves_san = []
+    evaluations = []
+    boards = [board.fen()]  # Initial position
+
+    # Load piece images
+    piece_images = {}
+    pieces = ['P', 'N', 'B', 'R', 'Q', 'K',
+              'p', 'n', 'b', 'r', 'q', 'k']
+    for piece in pieces:
+        if piece.isupper():
+            filename = os.path.join(IMAGE_DIR, f"{piece}.png")
+        else:
+            filename = os.path.join(IMAGE_DIR, f"_{piece}.png")
+        try:
+            piece_image = Image.open(filename).resize((50, 50), Image.Resampling.LANCZOS)
+            piece_images[piece] = piece_image
+        except FileNotFoundError:
+            messagebox.showerror("Image Error", f"Image file for {piece} not found at {filename}.")
+            return
+
+    # Set up GUI layout
+    board_canvas = tk.Canvas(game_window, width=400, height=400)
+    board_canvas.pack(side=tk.LEFT)
+    
+    info_frame = tk.Frame(game_window)
+    info_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+    
+    # Move list display
+    move_list = tk.Text(info_frame, width=30, height=20)
+    move_list.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+    
+    move_list.insert('end', "Move List\nYou vs AI Model\n")
+    
+    ai_eval_label = tk.Label(info_frame, text="AI Evaluation: N/A")
+    ai_eval_label.pack()
+    
+    board_images = []
+    selected_square = None  # Keep track of selected square
+
+    def drawHighlightedSquare(square):
+        square_size = 50
+        file, rank = chess.square_file(square), 7 - chess.square_rank(square)
+        x0 = file * square_size
+        y0 = rank * square_size
+        x1 = x0 + square_size
+        y1 = y0 + square_size
+        board_canvas.create_rectangle(x0, y0, x1, y1, outline="red", width=2, tags="highlight")
+
+    def removeHighlightedSquare():
+        board_canvas.delete("highlight")
+
+    def prompt_promotion():
+        promo_window = tk.Toplevel(game_window)
+        promo_window.title("Choose Promotion")
+        promo_window.grab_set()
+        promotion_choice = tk.StringVar()
+        promotion_choice.set("q")
+        options = [("Queen", "q"), ("Rook", "r"), ("Bishop", "b"), ("Knight", "n")]
+        tk.Label(promo_window, text="Choose promotion piece:").pack(pady=10)
+        for text, value in options:
+            tk.Radiobutton(promo_window, text=text, variable=promotion_choice, value=value).pack(anchor=tk.W)
+        def confirm():
+            promo_window.destroy()
+        tk.Button(promo_window, text="OK", command=confirm).pack(pady=10)
+        game_window.wait_window(promo_window)
+        promotion_map = {
+            "q": chess.QUEEN,
+            "r": chess.ROOK,
+            "b": chess.BISHOP,
+            "n": chess.KNIGHT
+        }
+        return promotion_map.get(promotion_choice.get(), chess.QUEEN)
+
+    def on_click(event):
+        nonlocal selected_square, move_number
+        file, rank = event.x // 50, 7 - (event.y // 50)
+        square = chess.square(file, rank)
+        removeHighlightedSquare()
+        if selected_square is None:
+            piece = board.piece_at(square)
+            if piece and piece.color == board.turn:
+                selected_square = square
+                drawHighlightedSquare(square)
+        elif selected_square == square:
+            selected_square = None
+        else:
+            piece = board.piece_at(selected_square)
+            if piece and piece.piece_type == chess.PAWN:
+                is_promotion = (
+                    (piece.color == chess.WHITE and chess.square_rank(square) == 7) or
+                    (piece.color == chess.BLACK and chess.square_rank(square) == 0)
+                )
+            else:
+                is_promotion = False
+            if is_promotion:
+                promotion = prompt_promotion()
+                if promotion is None:
+                    selected_square = None
+                    return
+                move = chess.Move(selected_square, square, promotion=promotion)
+            else:
+                move = chess.Move(selected_square, square)
+            if move in board.legal_moves:
+                # Get SAN before pushing the move
+                move_san = board.san(move)
+                board.push(move)
+                moves_san.append(move_san)
+                boards.append(board.fen())
+                selected_square = None
+                update_board()
+                # Update move list
+                move_index = len(moves_san) - 1
+                if board.turn == chess.BLACK:
+                    move_text = f"{move_number:3}. {moves_san[-1]:8} "
+                else:
+                    move_text = f"{moves_san[-1]}\n"
+                    move_number += 1
+
+                # Get start index before inserting text
+                move_list.insert('end', move_text)
+                end_index = move_list.index('end -1c')
+
+                tag_name = f"move_{move_index}"
+                move_list.tag_add(tag_name, f'end - {len(move_text)}c', end_index)
+                move_list.tag_bind(tag_name, "<Button-1>", on_move_click)
+
+                # Check for game over
+                if board.is_game_over():
+                    result = board.result()
+                    messagebox.showinfo("Game Over", f"Game over: {result}")
+                    game_window.destroy()
+                    return
+
+                # AI's turn
+                ai_move()
+            else:
+                messagebox.showinfo("Invalid Move", "This move is not allowed.")
+            selected_square = None
+            update_board()
+
+    def on_right_click(event):
+        nonlocal selected_square
+        if selected_square:
+            removeHighlightedSquare()
+            selected_square = None
+
+    def update_board():
+        board_image = Image.new("RGB", (400, 400), "white")
+        draw_board(board, board_image)
+        board_tk = ImageTk.PhotoImage(board_image)
+        board_images.append(board_tk)  # Prevent garbage collection
+        board_canvas.create_image(0, 0, anchor="nw", image=board_tk)
+
+    def draw_board(board: chess.Board, image: Image.Image):
+        square_size = 50
+        for rank in range(8):
+            for file in range(8):
+                # Flip the rank to have white at the bottom
+                actual_rank = 7 - rank
+                square = chess.square(file, actual_rank)
+                color = "lightgray" if (rank + file) % 2 == 0 else "darkgreen"
+                x0 = file * square_size
+                y0 = rank * square_size  # y0 corresponds to the flipped rank
+                x1 = x0 + square_size
+                y1 = y0 + square_size
+                image.paste(color, (x0, y0, x1, y1))
+
+                # Draw the pieces
+                piece = board.piece_at(square)
+                if piece:
+                    piece_symbol = piece.symbol()
+                    piece_image = piece_images.get(piece_symbol)
+                    if piece_image:
+                        image.paste(piece_image, (x0, y0), piece_image)
+
+    def ai_move():
+        nonlocal move_number
+        # AI's move
+        chosen_move = ai.select_best_move(board)  # Adjust depth as needed
+        if chosen_move is None:
+            chosen_move = random.choice(list(board.legal_moves))
+        board.push(chosen_move)
+        move_san = board.san(chosen_move)
+        moves_san.append(move_san)
+        boards.append(board.fen())
+        update_board()
+
+        # Update move list
+        move_index = len(moves_san) - 1
+        if board.turn == chess.WHITE:
+            move_text = f"{moves_san[-1]}\n"
+            move_number += 1
+        else:
+            move_text = f"{move_number:3}. ... {moves_san[-1]:8} "
+
+        # Get start index before inserting text
+        move_list.insert('end', move_text)
+        end_index = move_list.index('end -1c')
+
+        tag_name = f"move_{move_index}"
+        move_list.tag_add(tag_name, f'end - {len(move_text)}c', end_index)
+        move_list.tag_bind(tag_name, "<Button-1>", on_move_click)
+
+        # Get AI evaluation
+        state = board_to_tensor(board).unsqueeze(0).to(device)
+        with torch.no_grad():
+            _, value = model_instance(state)  # type: ignore
+            model_eval = value.item()
+            model_eval = max(min(model_eval, MAX_EVAL), MIN_EVAL)
+
+        ai_eval_label.config(text=f"AI Evaluation: {model_eval:.4f}")
+
+        # Check for game over
+        if board.is_game_over():
+            result = board.result()
+            messagebox.showinfo("Game Over", f"Game over: {result}")
+            game_window.destroy()
+            return
+
+    def on_move_click(event):
+        """Handles clicking on a move in the move list to jump to that position."""
+        index = move_list.index(f"@{event.x},{event.y}")
+        tags = move_list.tag_names(index)
+        for tag in tags:
+            if tag.startswith("move_"):
+                move_index = int(tag.split("_")[1])
+                break
+        else:
+            return
+        fen = boards[move_index + 1]  # +1 because boards[0] is initial position
+        board.set_fen(fen)
+        update_board()
+
+    def reset_game():
+        nonlocal board, move_number, moves_san, evaluations, boards, selected_square
+        board = chess.Board()
+        board.turn = chess.WHITE
+        move_number = 1
+        moves_san = []
+        evaluations = []
+        boards = [board.fen()]
+        selected_square = None
+        move_list.delete('1.0', tk.END)
+        move_list.insert('end', "Move List\nYou vs AI Model\n")
+        update_board()
+        ai_eval_label.config(text="AI Evaluation: N/A")
+
+    reset_button = tk.Button(info_frame, text="Reset Game", command=reset_game)
+    reset_button.pack()
+
+    update_board()
+
+    board_canvas.bind("<Button-1>", on_click)
+    board_canvas.bind("<Button-3>", on_right_click)
+    game_window.mainloop()
+
 # Custom class to redirect stdout and stderr to a queue
 class RedirectText:
     def __init__(self, log_queue):
@@ -1266,6 +1544,13 @@ def main():
 
     play_button = tk.Button(control_frame, text="Play Against Stockfish", command=play)
     play_button.grid(row=0, column=3, padx=5, pady=5)
+    
+    # Play against AI Model button
+    def play_against_model_button():
+        play_against_model(ai)
+
+    play_model_button = tk.Button(control_frame, text="Play Against AI Model", command=play_against_model_button)
+    play_model_button.grid(row=0, column=4, padx=5, pady=5)
 
     # Close button
     close_button = tk.Button(control_frame, text="Close", command=lambda: exit_program(root, stop_event, training_thread))

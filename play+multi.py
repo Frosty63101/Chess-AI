@@ -1,67 +1,38 @@
 import tkinter as tk
 from tkinter import messagebox
 import chess
-from sympy import ordered
 import torch
 import torch.nn as nn
-import torch.nn.functional as F  # Added import
+import torch.nn.functional as F
 import numpy as np
 from PIL import Image, ImageTk
 import os
-import random
-import time
-from functools import lru_cache
 import threading
-from queue import Queue
-from typing import Optional, DefaultDict
+import time
 from collections import defaultdict
 import math
+import queue
+import random
+from typing import Optional, Dict
 
-ACTION_SIZE = 4672  # Added constant
+# Import for Zobrist hashing
+from chess.polyglot import zobrist_hash
 
-# Adjusted model path to match the second program's model
-MODEL_PATH = "chess_model+multi.pth"
+# Constants
+ACTION_SIZE = 4672
+MODEL_PATH = "chess_model.pth"  # Updated to match the second program's model path
+MAX_EVAL = 10.0
+MIN_EVAL = -10.0
+MAX_DEPTH = 100
+MAX_TIME = 10.0
 
-class TranspositionEntry:
-    """Data structure for transposition table entries."""
-    def __init__(self, eval_score: Optional[float] = None, freq: int = 0, pv_move: Optional[chess.Move] = None):
-        self.eval = eval_score
-        self.freq = freq
-        self.pv_move = pv_move
+# Global model instance
+model_instance = None
 
-class Node:
-    def __init__(self, parent, prior_prob):
-        self.parent = parent
-        self.children = {}  # action: Node
-        self.visit_count = 0
-        self.total_value = 0
-        self.prior_prob = prior_prob
-
-    def select_child(self):
-        C_PUCT = 1.0  # Exploration constant
-        best_score = -float('inf')
-        best_action = None
-        best_child = None
-        for action, child in self.children.items():
-            u = C_PUCT * child.prior_prob * (math.sqrt(self.visit_count) / (1 + child.visit_count))
-            q = child.total_value / (1 + child.visit_count)
-            score = q + u
-            if score > best_score:
-                best_score = score
-                best_action = action
-                best_child = child
-        return best_action, best_child
-
-    def expand(self, action_priors):
-        for action, prob in action_priors:
-            if action not in self.children:
-                self.children[action] = Node(self, prob)
-
-    def backpropagate(self, value):
-        self.visit_count += 1
-        self.total_value += value
-        if self.parent:
-            self.parent.backpropagate(-value)
+# Locks for thread safety
+eval_cache_lock = threading.Lock()
+board_tensor_cache_lock = threading.Lock()
+transposition_table_lock = threading.Lock()
 
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
@@ -70,7 +41,7 @@ class ResidualBlock(nn.Module):
         self.bn1 = nn.BatchNorm2d(channels)
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm2d(channels)
-
+    
     def forward(self, x):
         residual = x
         out = F.relu(self.bn1(self.conv1(x)))
@@ -84,7 +55,7 @@ class ChessNet(nn.Module):
         super(ChessNet, self).__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.conv_block = nn.Sequential(
-            nn.Conv2d(13, 256, kernel_size=3, padding=1),  # Changed from 12 to 13 input channels
+            nn.Conv2d(13, 256, kernel_size=3, padding=1),
             nn.BatchNorm2d(256),
             nn.ReLU()
         )
@@ -105,10 +76,9 @@ class ChessNet(nn.Module):
             nn.Flatten(),
             nn.Linear(1 * 8 * 8, 256),
             nn.ReLU(),
-            nn.Linear(256, 1),
-            nn.Tanh()
+            nn.Linear(256, 1)  # Removed Tanh to match the second program's model
         )
-
+    
     def forward(self, x):
         x = self.conv_block(x)
         x = self.residual_blocks(x)
@@ -116,138 +86,65 @@ class ChessNet(nn.Module):
         value = self.value_head(x)
         return policy, value
 
-class MCTS:
-    def __init__(self, model, device):
-        self.model = model
-        self.device = device
-
-    def search(self, board, num_simulations=800):
-        root = Node(parent=None, prior_prob=1.0)
-        for _ in range(num_simulations):
-            node = root
-            state = board.copy()
-            # Selection
-            path = []
-            while node is not None and node.children:
-                action, node = node.select_child()
-                state.push(action)
-                path.append(node)
-            # Expansion
-            if not state.is_game_over():
-                policy, value = self.evaluate_state(state)
-                action_probs = []
-                for move in state.legal_moves:
-                    idx = move_to_index(move)
-                    prob = policy[idx]
-                    action_probs.append((move, prob))
-                if node is not None:
-                    node.expand(action_probs)
-            else:
-                # Game over
-                value = self.game_over_value(state)
-            # Backpropagation
-            self.backpropagate(node, value)
-        # Choose action with highest visit count
-        best_move = max(root.children.items(), key=lambda item: item[1].visit_count)[0]
-        policy = np.zeros(ACTION_SIZE)
-        for action, child in root.children.items():
-            idx = move_to_index(action)
-            policy[idx] = child.visit_count
-        policy = policy / np.sum(policy)
-        return best_move, policy
-
-    def evaluate_state(self, state):
-        state_tensor = board_to_tensor(state).unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            policy_logits, value = self.model(state_tensor)
-            policy = torch.softmax(policy_logits, dim=1).cpu().numpy()[0]
-        return policy, value.item()
-
-    def game_over_value(self, state):
-        # Returns +1, -1, or 0 for win, loss, or draw from current player's perspective
-        result = state.result()
-        if result == '1-0':
-            return 1 if state.turn == chess.WHITE else -1
-        elif result == '0-1':
-            return -1 if state.turn == chess.WHITE else 1
-        else:
-            return 0
-
-    def backpropagate(self, node, value):
-        while node is not None:
-            node.visit_count += 1
-            node.total_value += value
-            value = -value  # Switch perspectives
-            node = node.parent
-
-# Global transposition table with evaluations and frequency counts
-history_table = defaultdict(int)
-pv_table = {}
-
-def move_to_index(move: chess.Move) -> int:
-    """Converts a move to an index in the policy output."""
-    # Initialize constants
-    NUM_SQUARES = 64
-    NUM_PROMOTION_PIECES = 4  # Queen, Rook, Bishop, Knight
-
-    from_square = move.from_square
-    to_square = move.to_square
-    promotion = move.promotion
-
-    if promotion is None:
-        # Normal move
-        index = from_square * NUM_SQUARES + to_square
-    else:
-        # Promotion move
-        promotion_index = {chess.QUEEN: 0, chess.ROOK: 1, chess.BISHOP: 2, chess.KNIGHT: 3}[promotion]
-        index = NUM_SQUARES * NUM_SQUARES + (from_square - 8) * NUM_PROMOTION_PIECES + promotion_index
-    return index
-
-def index_to_move(idx: int, board: chess.Board) -> Optional[chess.Move]:
-    """Converts an index in the policy output to a move."""
-    NUM_SQUARES = 64
-    NUM_PROMOTION_PIECES = 4  # Queen, Rook, Bishop, Knight
-
-    if idx < NUM_SQUARES * NUM_SQUARES:
-        from_square = idx // NUM_SQUARES
-        to_square = idx % NUM_SQUARES
-        move = chess.Move(from_square, to_square)
-    else:
-        idx -= NUM_SQUARES * NUM_SQUARES
-        from_square = idx // NUM_PROMOTION_PIECES + 8
-        promotion_index = idx % NUM_PROMOTION_PIECES
-        promotion_piece = [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT][promotion_index]
-        # For promotion, to_square is one rank ahead for pawns
-        to_square = from_square + 8 if board.turn == chess.WHITE else from_square - 8
-        move = chess.Move(from_square, to_square, promotion=promotion_piece)
-
-    if move in board.legal_moves:
-        return move
-    else:
-        return None
-
-# Initialize the model globally for multiprocessing
-def init_model():
+def initialize_model(device: torch.device):
+    """Initializes the global model instance and loads pre-trained weights if available."""
     global model_instance
     model_instance = ChessNet()
-    model_instance.load_state_dict(torch.load(MODEL_PATH, map_location="cpu"))
-    model_instance.to(torch.device("cpu"))
-    model_instance.eval()
+    print(f"Using device: {device}")
+    model_instance.to(device)
+    if os.path.exists(MODEL_PATH):
+        try:
+            checkpoint = torch.load(MODEL_PATH, map_location=device)
+            if 'model_state_dict' in checkpoint:
+                state_dict = checkpoint['model_state_dict']
+            else:
+                state_dict = checkpoint
+            model_instance.load_state_dict(state_dict)
+            print(f"Model loaded from {MODEL_PATH}")
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            print("Starting with a fresh model.")
+    else:
+        print("No saved model found. Starting with a fresh model.")
 
-@lru_cache(maxsize=20000)
-def cached_board_evaluation(fen: str) -> float:
-    """Evaluates the board using material balance and the neural network."""
-    board = chess.Board(fen)
+def evaluate_board(board: chess.Board, ai: 'ChessAI') -> float:
+    """Evaluates the board using material balance and the neural network, with caching."""
+    board_hash = zobrist_hash(board)
+    with eval_cache_lock:
+        if board_hash in ai.eval_cache:
+            return ai.eval_cache[board_hash]
+    
     # Material evaluation
     material_score = material_evaluation(board)
+    
     # Neural network evaluation
-    state = board_to_tensor(board).unsqueeze(0).to(model_instance.device)
+    state = board_to_tensor_cached(board, ai)
     with torch.no_grad():
-        _, value = model_instance(state)
+        _, value = ai.model(state)  # type: ignore
         nn_eval = value.item()
+    
+    # Clamp neural network evaluation between -10 and 10
+    nn_eval = max(min(nn_eval, MAX_EVAL), MIN_EVAL)
+    
     # Combine evaluations
     eval_score = nn_eval + material_score
+    eval_score = max(min(eval_score, MAX_EVAL), MIN_EVAL)
+    
+    # Cache the evaluation
+    with eval_cache_lock:
+        ai.eval_cache[board_hash] = eval_score
+    
     return eval_score
+
+def board_to_tensor_cached(board: chess.Board, ai: 'ChessAI') -> torch.Tensor:
+    """Converts a chess board to a tensor representation with caching."""
+    board_hash = zobrist_hash(board)
+    with board_tensor_cache_lock:
+        if board_hash in ai.board_tensor_cache:
+            return ai.board_tensor_cache[board_hash]
+        tensor = board_to_tensor(board).unsqueeze(0).to(ai.device)  # type: ignore
+        ai.board_tensor_cache[board_hash] = tensor
+    return tensor
 
 def material_evaluation(board: chess.Board) -> float:
     """Calculates the material balance of the board."""
@@ -257,48 +154,23 @@ def material_evaluation(board: chess.Board) -> float:
         chess.BISHOP: 3,
         chess.ROOK: 5,
         chess.QUEEN: 9,
-        chess.KING: 0  # King's value is not added to material score
+        chess.KING: 0
     }
-    white_material = 0
-    black_material = 0
-    for piece_type in piece_values:
-        white_material += len(board.pieces(piece_type, chess.WHITE)) * piece_values[piece_type]
-        black_material += len(board.pieces(piece_type, chess.BLACK)) * piece_values[piece_type]
-    # Positive score if white is ahead, negative if black is ahead
+    white_material = sum(len(board.pieces(pt, chess.WHITE)) * val for pt, val in piece_values.items())
+    black_material = sum(len(board.pieces(pt, chess.BLACK)) * val for pt, val in piece_values.items())
     material_score = white_material - black_material
-    # Normalize the score
-    material_score /= 39  # Max possible material value difference
+    material_score /= 39
     return material_score
 
 def board_to_tensor(board: chess.Board) -> torch.Tensor:
     """Converts a chess board to a tensor representation with piece values."""
     piece_to_channel = {
-        'P': 0,  # White Pawn
-        'N': 1,  # White Knight
-        'B': 2,  # White Bishop
-        'R': 3,  # White Rook
-        'Q': 4,  # White Queen
-        'K': 5,  # White King
-        'p': 6,  # Black Pawn
-        'n': 7,  # Black Knight
-        'b': 8,  # Black Bishop
-        'r': 9,  # Black Rook
-        'q':10,  # Black Queen
-        'k':11   # Black King
+        'P': 0, 'N': 1, 'B': 2, 'R': 3, 'Q': 4, 'K': 5,
+        'p': 6, 'n': 7, 'b': 8, 'r': 9, 'q':10, 'k':11
     }
     piece_values = {
-        'P': 1,
-        'N': 3,
-        'B': 3,
-        'R': 5,
-        'Q': 9,
-        'K': 0,
-        'p': -1,
-        'n': -3,
-        'b': -3,
-        'r': -5,
-        'q': -9,
-        'k': 0
+        'P': 1, 'N': 3, 'B': 3, 'R': 5, 'Q': 9, 'K': 0,
+        'p': -1, 'n': -3, 'b': -3, 'r': -5, 'q': -9, 'k': 0
     }
     board_tensor = np.zeros((12, 8, 8), dtype=np.float32)
     value_tensor = np.zeros((1, 8, 8), dtype=np.float32)
@@ -312,111 +184,301 @@ def board_to_tensor(board: chess.Board) -> torch.Tensor:
             y = 7 - (square // 8)
             board_tensor[channel, y, x] = 1
             value_tensor[0, y, x] = value
-    # Combine piece presence and value tensors
     combined_tensor = np.concatenate((board_tensor, value_tensor), axis=0)
     return torch.tensor(combined_tensor, dtype=torch.float32)
 
-def evaluate_move(task):
-    move, board_fen, depth = task
-    board = chess.Board(board_fen)
-    board.push(move)
-    eval_score = minimax_evaluate_serial(board, depth)
-    return (eval_score, move)
+def move_to_index(move: chess.Move) -> int:
+    """Converts a move to an index in the policy output."""
+    NUM_SQUARES = 64
+    NUM_PROMOTION_PIECES = 4
+    from_square = move.from_square
+    to_square = move.to_square
+    promotion = move.promotion
 
-def minimax_evaluate_serial(board, depth):
-    transposition_table = {}
-    return minimax_evaluate_helper(board, depth, -float('inf'), float('inf'), False, transposition_table)
-
-def minimax_evaluate_helper(board, depth, alpha, beta, is_maximizing, transposition_table):
-    board_fen = board.fen()
-    if board_fen in transposition_table:
-        return transposition_table[board_fen]
-
-    if depth == 0 or board.is_game_over():
-        eval_score = cached_board_evaluation(board_fen)
-        transposition_table[board_fen] = eval_score
-        return eval_score
-
-    if is_maximizing:
-        max_eval = -float('inf')
-        ordered_moves = order_moves_serial(board)
-        for move in ordered_moves:
-            board.push(move)
-            eval_score = minimax_evaluate_helper(board, depth - 1, alpha, beta, False, transposition_table)
-            board.pop()
-            max_eval = max(max_eval, eval_score)
-            alpha = max(alpha, eval_score)
-            if beta <= alpha:
-                break
-        transposition_table[board_fen] = max_eval
-        return max_eval
+    if promotion is None:
+        index = from_square * NUM_SQUARES + to_square
     else:
-        min_eval = float('inf')
-        ordered_moves = order_moves_serial(board)
-        for move in ordered_moves:
-            board.push(move)
-            eval_score = minimax_evaluate_helper(board, depth - 1, alpha, beta, True, transposition_table)
+        promotion_index = {chess.QUEEN: 0, chess.ROOK: 1, chess.BISHOP: 2, chess.KNIGHT: 3}[promotion]
+        index = NUM_SQUARES * NUM_SQUARES + (from_square - 8) * NUM_PROMOTION_PIECES + promotion_index
+    return index
+
+def index_to_move(idx: int, board: chess.Board) -> Optional[chess.Move]:
+    """Converts an index in the policy output to a move."""
+    NUM_SQUARES = 64
+    NUM_PROMOTION_PIECES = 4
+
+    if idx < NUM_SQUARES * NUM_SQUARES:
+        from_square = idx // NUM_SQUARES
+        to_square = idx % NUM_SQUARES
+        move = chess.Move(from_square, to_square)
+    else:
+        idx -= NUM_SQUARES * NUM_SQUARES
+        from_square = idx // NUM_PROMOTION_PIECES + 8
+        promotion_index = idx % NUM_PROMOTION_PIECES
+        promotion_piece = [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT][promotion_index]
+        to_square = from_square + 8 if board.turn == chess.WHITE else from_square - 8
+        move = chess.Move(from_square, to_square, promotion=promotion_piece)
+
+    if move in board.legal_moves:
+        return move
+    else:
+        return None
+
+def iterative_deepening(board: chess.Board, ai: 'ChessAI', max_time: float = MAX_TIME) -> Optional[chess.Move]:
+    """Performs iterative deepening search within a time limit."""
+    best_move = None
+    depth = 1
+    start_time = time.time()
+    while True:
+        time_elapsed = time.time() - start_time
+        if time_elapsed >= max_time:
+            break
+        ai.search_stop = False
+        try:
+            best_move = ai.search(board, depth, start_time, max_time)
+        except TimeoutError:
+            break
+        depth += 1
+    return best_move
+
+def principal_variation_search(board: chess.Board, depth: int, alpha: float, beta: float, maximizing_player: bool, ai: 'ChessAI', start_time: float, max_time: float) -> float:
+    """Principal Variation Search algorithm with alpha-beta pruning and time management."""
+    # Check for timeout
+    if time.time() - start_time >= max_time or ai.search_stop:
+        ai.search_stop = True
+        raise TimeoutError("Search timed out")
+
+    # Transposition Table Lookup
+    transposition_key = zobrist_hash(board)
+    with transposition_table_lock:
+        if transposition_key in ai.transposition_table:
+            entry = ai.transposition_table[transposition_key]
+            if entry['depth'] >= depth:
+                return entry['value']
+
+    if board.is_game_over() or depth == 0:
+        eval = quiescence_search(board, alpha, beta, ai, start_time, max_time)
+        with transposition_table_lock:
+            ai.transposition_table[transposition_key] = {'value': eval, 'depth': depth}
+        return eval
+
+    moves = ai.order_moves(board, depth)
+    if not moves:
+        return evaluate_board(board, ai)
+
+    first_child = True
+    for move in moves:
+        board.push(move)
+        try:
+            if first_child:
+                score = -principal_variation_search(board, depth - 1, -beta, -alpha, not maximizing_player, ai, start_time, max_time)
+            else:
+                score = -principal_variation_search(board, depth - 1, -alpha - 1, -alpha, not maximizing_player, ai, start_time, max_time)
+                if alpha < score < beta:
+                    score = -principal_variation_search(board, depth - 1, -beta, -score, not maximizing_player, ai, start_time, max_time)
+        except TimeoutError:
             board.pop()
-            min_eval = min(min_eval, eval_score)
-            beta = min(beta, eval_score)
+            raise TimeoutError("Search timed out")
+        board.pop()
+
+        if score >= beta:
+            with transposition_table_lock:
+                ai.transposition_table[transposition_key] = {'value': beta, 'depth': depth}
+            return beta
+        if score > alpha:
+            alpha = score
+        first_child = False
+
+        # Check for timeout after each move
+        if time.time() - start_time >= max_time or ai.search_stop:
+            ai.search_stop = True
+            raise TimeoutError("Search timed out")
+
+    with transposition_table_lock:
+        ai.transposition_table[transposition_key] = {'value': alpha, 'depth': depth}
+    return alpha
+
+def quiescence_search(board: chess.Board, alpha: float, beta: float, ai: 'ChessAI', start_time: float, max_time: float) -> float:
+    """Extends the search at leaf nodes to capture sequences to avoid the horizon effect."""
+    # Check for timeout
+    if time.time() - start_time >= max_time or ai.search_stop:
+        ai.search_stop = True
+        raise TimeoutError("Search timed out")
+
+    stand_pat = evaluate_board(board, ai)
+    if stand_pat >= beta:
+        return beta
+    if alpha < stand_pat:
+        alpha = stand_pat
+
+    for move in ai.order_moves_quiescence(board):
+        board.push(move)
+        try:
+            score = -quiescence_search(board, -beta, -alpha, ai, start_time, max_time)
+        except TimeoutError:
+            board.pop()
+            raise TimeoutError("Search timed out")
+        board.pop()
+
+        if score >= beta:
+            return beta
+        if score > alpha:
+            alpha = score
+
+    return alpha
+
+class ChessAI:
+    """Encapsulates the chess AI functionalities, including the neural network and move selection."""
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.model = model_instance
+        self.history_table: Dict[chess.Move, int] = defaultdict(int)
+        self.pv_table: Dict[str, chess.Move] = {}
+        self.eval_cache = {}
+        self.transposition_table = {}
+        self.board_tensor_cache = {}
+        self.killer_moves = [[] for _ in range(MAX_DEPTH)]
+        self.search_stop = False
+    
+    def select_best_move(self, board: chess.Board, max_time: float = MAX_TIME):
+        """Selects the best move using iterative deepening and PVS within a time limit."""
+        return iterative_deepening(board, self, max_time)
+    
+    def search(self, board: chess.Board, depth: int, start_time: float, max_time: float) -> Optional[chess.Move]:
+        """Searches for the best move at a given depth."""
+        best_move = None
+        alpha = -float('inf')
+        beta = float('inf')
+        maximizing_player = board.turn == chess.WHITE
+        best_eval = -float('inf') if maximizing_player else float('inf')
+        moves = self.order_moves(board, depth)
+        if not moves:
+            return None
+
+        for move in moves:
+            time_elapsed = time.time() - start_time
+            if time_elapsed >= max_time or self.search_stop:
+                self.search_stop = True
+                raise TimeoutError("Search timed out")
+
+            board.push(move)
+            try:
+                eval = -principal_variation_search(board, depth - 1, -beta, -alpha, not maximizing_player, self, start_time, max_time)
+            except TimeoutError:
+                board.pop()
+                break
+            board.pop()
+
+            if maximizing_player:
+                if eval > best_eval:
+                    best_eval = eval
+                    best_move = move
+                alpha = max(alpha, eval)
+            else:
+                if eval < best_eval:
+                    best_eval = eval
+                    best_move = move
+                beta = min(beta, eval)
+
             if beta <= alpha:
                 break
-        transposition_table[board_fen] = min_eval
-        return min_eval
 
-def order_moves_serial(board):
-    ordered_moves = []
-    for move in board.legal_moves:
-        if board.is_capture(move):
-            ordered_moves.insert(0, move)  # Prioritize captures
-        elif board.gives_check(move):
-            ordered_moves.insert(0, move)  # Prioritize checks
-        else:
-            ordered_moves.append(move)
-    return ordered_moves
+        return best_move
+
+    def order_moves(self, board: chess.Board, depth: int):
+        """Orders moves using the model's policy network and heuristics."""
+        state = board_to_tensor_cached(board, self)
+        with torch.no_grad():
+            policy_logits, _ = self.model(state)  # type: ignore
+            policy = torch.softmax(policy_logits, dim=1).cpu().numpy()[0]
+
+        moves = list(board.legal_moves)
+        move_scores = []
+        for move in moves:
+            idx = move_to_index(move)
+            score = policy[idx]
+            # Add history heuristic
+            score += self.history_table.get(move, 0)
+            # Add killer move bonus
+            if move in self.killer_moves[depth]:
+                score += 10000
+            # Use MVV/LVA for captures
+            if board.is_capture(move):
+                captured_piece = board.piece_at(move.to_square)
+                attacker_piece = board.piece_at(move.from_square)
+                if captured_piece and attacker_piece:
+                    mvv_lva_score = (captured_piece.piece_type * 10) - attacker_piece.piece_type
+                    score += mvv_lva_score
+            move_scores.append((move, score))
+
+        ordered_moves = [move for move, _ in sorted(move_scores, key=lambda x: x[1], reverse=True)]
+        return ordered_moves
+
+    def order_moves_quiescence(self, board: chess.Board):
+        """Orders moves for quiescence search (captures only)."""
+        moves = [move for move in board.legal_moves if board.is_capture(move)]
+        move_scores = []
+        for move in moves:
+            captured_piece = board.piece_at(move.to_square)
+            attacker_piece = board.piece_at(move.from_square)
+            if captured_piece and attacker_piece:
+                mvv_lva_score = (captured_piece.piece_type * 10) - attacker_piece.piece_type
+                move_scores.append((move, mvv_lva_score))
+            else:
+                move_scores.append((move, 0))
+        ordered_moves = [move for move, _ in sorted(move_scores, key=lambda x: x[1], reverse=True)]
+        return ordered_moves
 
 class ChessGUI:
-    def __init__(self, model, master):
+    def __init__(self, ai: ChessAI, master):
         self.master = master
         self.master.title("Chess - Play Against AI")
-        
-        # Use the device from the main block
-        self.device = next(model.parameters()).device
-        self.model = model.to(self.device)
-        self.model.eval()
-        
+        self.ai = ai
         self.board = chess.Board()
-        
-        # Set up the board display
         self.canvas = tk.Canvas(master, width=400, height=400)
         self.canvas.pack()
-        
         self.board_images = []
-        
         self.load_piece_images()
+        self.move_history = []
+        self.current_move_index = 0
+        self.opening_book = {
+            'e2e4 e7e5': "King's Pawn Game",
+            'e2e4 e7e5 g1f3': "King's Knight Opening",
+            'e2e4 e7e5 g1f3 b8c6': "Italian Game",
+            'e2e4 e7e5 g1f3 b8c6 f1c4': "Giuoco Piano",
+            'd2d4 d7d5': "Queen's Pawn Game",
+            'd2d4 d7d5 c1g5': "Trompowsky Attack",
+            # Add more openings as needed
+        }
+
+        # Initialize message and opening_label before updating the board
+        self.message = tk.Label(master, text="Your move", font=("Arial", 12))
+        self.message.pack()
+        self.opening_label = tk.Label(master, text="", font=("Arial", 12))
+        self.opening_label.pack()
+        self.button_frame = tk.Frame(master)
+        self.button_frame.pack()
+
+        self.prev_button = tk.Button(self.button_frame, text="Previous", command=self.on_prev)
+        self.prev_button.pack(side=tk.LEFT)
+
+        self.next_button = tk.Button(self.button_frame, text="Next", command=self.on_next)
+        self.next_button.pack(side=tk.LEFT)
+
+        self.resume_button = tk.Button(self.button_frame, text="Resume", command=self.on_resume)
+        self.resume_button.pack(side=tk.LEFT)
+
+        # Now you can safely update the board
         self.update_board()
 
         self.canvas.bind("<Button-1>", self.on_click)
         self.canvas.bind("<Button-3>", self.on_right_click)
-        
-        # Game messages
-        self.message = tk.Label(master, text="Your move", font=("Arial", 12))
-        self.message.pack()
-
-        # Track moves
         self.selected_square = None
-        
-        self.transposition_table: DefaultDict[str, dict] = defaultdict(
-            lambda: {'eval': None, 'freq': 0, 'pv_move': None}
-        )
-
-        
-        # AI computation thread and queue
         self.ai_thread = None
         self.premove = None
         self.ai_busy = False
-        self.queue = Queue()
-
+        self.queue = queue.Queue()
+    
     def load_piece_images(self):
         self.piece_images = {}
         pieces = "PNBRQKpnbrqk"
@@ -433,39 +495,66 @@ class ChessGUI:
                     messagebox.showerror("Error", f"Image file {img_path} not found.")
                     self.master.destroy()
                 self.piece_images[piece] = Image.open(img_path).resize((50, 50), Image.Resampling.LANCZOS)
-
+    
     def update_board(self):
+        # Rebuild the board up to current_move_index
+        self.board = chess.Board()
+        for move in self.move_history[:self.current_move_index]:
+            self.board.push(move)
+        # Then draw the board
         board_image = Image.new("RGB", (400, 400), "white")
         self.draw_board(self.board, board_image)
         board_tk = ImageTk.PhotoImage(board_image)
         self.board_images.append(board_tk)
-        
-        # Clear previous images and display the new one
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor="nw", image=board_tk)
-
+        # Update the message
+        if self.current_move_index < len(self.move_history):
+            self.message.config(text="Viewing move {}/{}".format(self.current_move_index, len(self.move_history)))
+        else:
+            if self.board.is_game_over():
+                result = self.board.result()
+                self.message.config(text=f"Game Over: {result}")
+            else:
+                if self.board.turn == chess.WHITE:
+                    self.message.config(text="Your move")
+                else:
+                    self.message.config(text="AI's move")
+        # Display the opening if any
+        self.display_opening()
+    
+    def display_opening(self):
+        move_sequence = ' '.join([move.uci() for move in self.move_history[:self.current_move_index]])
+        matching_opening = None
+        max_length = 0
+        for opening_moves, opening_name in self.opening_book.items():
+            if move_sequence.startswith(opening_moves):
+                if len(opening_moves) > max_length:
+                    matching_opening = opening_name
+                    max_length = len(opening_moves)
+        if matching_opening:
+            self.opening_label.config(text=f"Opening: {matching_opening}")
+        else:
+            self.opening_label.config(text="")
+    
     def draw_board(self, board, image):
         square_size = 50
-        for rank in range(7, -1, -1):  # Start from rank 7 to 0, placing white at the bottom
+        for rank in range(7, -1, -1):
             for file in range(8):
                 color = "lightgray" if (rank + file) % 2 == 0 else "darkgreen"
                 x0 = file * square_size
-                y0 = (7 - rank) * square_size  # Rank is reversed for correct visual placement
+                y0 = (7 - rank) * square_size
                 x1 = x0 + square_size
                 y1 = y0 + square_size
-
-                # Draw square color
                 square_image = Image.new("RGB", (square_size, square_size), color)
                 image.paste(square_image, (x0, y0))
-
-                # Place piece image if present on the square
                 square = chess.square(file, rank)
                 piece = board.piece_at(square)
                 if piece:
                     piece_symbol = piece.symbol()
                     piece_image = self.piece_images[piece_symbol]
                     image.paste(piece_image, (x0, y0), piece_image)
-
+    
     def drawHighlightedSquare(self, square):
         square_size = 50
         file, rank = chess.square_file(square), 7 - chess.square_rank(square)
@@ -473,21 +562,18 @@ class ChessGUI:
         y0 = rank * square_size
         x1 = x0 + square_size
         y1 = y0 + square_size
-
-        # Draw a red rectangle around the square with a specific tag
         self.canvas.create_rectangle(x0, y0, x1, y1, outline="red", width=2, tags="highlight")
-
+    
     def removeHighlightedSquare(self):
-        # Remove the rectangle with the "highlight" tag
         self.canvas.delete("highlight")
-
+    
     def on_click(self, event):
-        # Adjust to match the orientation in draw_board
-        file, rank = event.x // 50, 7 - (event.y // 50)  # Ensure this matches board rendering
+        if self.current_move_index != len(self.move_history):
+            messagebox.showinfo("Info", "Cannot make a move when viewing old positions. Click 'Resume' to return to the latest position.")
+            return
+        file, rank = event.x // 50, 7 - (event.y // 50)
         square = chess.square(file, rank)
-    
         self.drawHighlightedSquare(square)
-    
         if self.selected_square is None:
             self.selected_square = square
         elif self.selected_square == square:
@@ -496,36 +582,30 @@ class ChessGUI:
         else:
             piece = self.board.piece_at(self.selected_square)
             if piece and piece.piece_type == chess.PAWN:
-                # Determine if the pawn is moving to the last rank
                 is_promotion = (
                     (piece.color == chess.WHITE and chess.square_rank(square) == 7) or
                     (piece.color == chess.BLACK and chess.square_rank(square) == 0)
                 )
             else:
                 is_promotion = False
-    
             if is_promotion:
-                # Prompt the user to choose a promotion piece
                 promotion = self.prompt_promotion()
                 if promotion is None:
-                    # User cancelled promotion
                     self.removeHighlightedSquare()
                     self.selected_square = None
                     return
-                # Create a move with the selected promotion piece
                 move = chess.Move(self.selected_square, square, promotion=promotion)
             else:
-                # Create a regular move without promotion
                 move = chess.Move(self.selected_square, square)
-    
             if move in self.board.legal_moves:
                 if self.ai_busy:
-                    # If AI is busy, set premove
                     self.premove = move
                     self.message.config(text="Premove registered")
                 else:
-                    # Push the move to the board
                     self.board.push(move)
+                    # Add the move to move_history
+                    self.move_history.append(move)
+                    self.current_move_index += 1
                     self.update_board()
                     if self.board.is_game_over():
                         result = self.board.result()
@@ -534,40 +614,24 @@ class ChessGUI:
                         self.message.config(text="AI's move")
                         self.start_ai_move()
             else:
-                # Move is invalid
                 messagebox.showinfo("Invalid Move", "This move is not allowed.")
-    
-            # Clean up selection and highlighting
             self.removeHighlightedSquare()
             self.selected_square = None
-
-
+    
     def prompt_promotion(self):
-    # Create a new top-level window
         promo_window = tk.Toplevel(self.master)
         promo_window.title("Choose Promotion")
-        promo_window.grab_set()  # Make the window modal
-
-        # Initialize a local variable to store the result
-        result_dict = {'result': None}
-
-        # Variable to store the selected promotion
+        promo_window.grab_set()
+        result_dict: dict[str, Optional[int]] = {'result': None}
         promotion_choice = tk.StringVar()
-        promotion_choice.set("q")  # Default to queen
-
-        # Define promotion options
+        promotion_choice.set("q")
         options = [("Queen", "q"), ("Rook", "r"), ("Bishop", "b"), ("Knight", "n")]
-
         tk.Label(promo_window, text="Choose promotion piece:").pack(pady=10)
-
         for text, value in options:
             tk.Radiobutton(promo_window, text=text, variable=promotion_choice, value=value).pack(anchor=tk.W)
-
-        # Function to handle confirmation
         def confirm():
             promo = promotion_choice.get()
             promo_window.destroy()
-            # Map to chess library constants
             promotion_map = {
                 "q": chess.QUEEN,
                 "r": chess.ROOK,
@@ -575,134 +639,79 @@ class ChessGUI:
                 "n": chess.KNIGHT
             }
             return_value = promotion_map.get(promo, chess.QUEEN)
-            # Store the result in a nonlocal variable
-            result_dict['result'] = return_value  # type: ignore
-    
-        # Confirm button
+            result_dict['result'] = return_value
         tk.Button(promo_window, text="OK", command=confirm).pack(pady=10)
-
-        # Wait for the window to close
         self.master.wait_window(promo_window)
-
-        # Retrieve the result
         return result_dict.get('result', None)
-
-
+    
     def on_right_click(self, event):
         if self.selected_square:
             self.removeHighlightedSquare()
             self.selected_square = None
-
+    
+    def on_prev(self):
+        if self.current_move_index > 0:
+            self.current_move_index -= 1
+            self.update_board()
+    
+    def on_next(self):
+        if self.current_move_index < len(self.move_history):
+            self.current_move_index += 1
+            self.update_board()
+    
+    def on_resume(self):
+        self.current_move_index = len(self.move_history)
+        self.update_board()
+    
     def start_ai_move(self):
         if self.ai_thread and self.ai_thread.is_alive():
-            # AI is already thinking
             return
         self.ai_busy = True
         self.ai_thread = threading.Thread(target=self.ai_move, daemon=True)
         self.ai_thread.start()
         self.master.after(100, self.check_ai_thread)
-
+    
     def check_ai_thread(self):
         if self.ai_thread and self.ai_thread.is_alive():
             self.master.after(100, self.check_ai_thread)
         else:
-            # AI has finished its move
-            start_time, best_move = self.queue.get()
-            self.board.push(best_move)
-            self.update_board()
-            if self.board.is_game_over():
-                result = self.board.result()
-                self.message.config(text=f"Game Over: {result}")
+            best_move = self.queue.get()
+            if best_move is not None:
+                self.board.push(best_move)
+                # Add to move_history
+                self.move_history.append(best_move)
+                self.current_move_index += 1
+                self.update_board()
+                if self.board.is_game_over():
+                    result = self.board.result()
+                    self.message.config(text=f"Game Over: {result}")
+                else:
+                    self.message.config(text="Your move")
+                    if self.premove:
+                        self.board.push(self.premove)
+                        # Add the move to move_history
+                        self.move_history.append(self.premove)
+                        self.current_move_index += 1
+                        self.update_board()
+                        self.premove = None
+                        if self.board.is_game_over():
+                            result = self.board.result()
+                            self.message.config(text=f"Game Over: {result}")
+                        else:
+                            self.message.config(text="AI's move")
+                            self.start_ai_move()
             else:
-                self.message.config(text="Your move")
-                # Execute premove if any
-                if self.premove:
-                    self.board.push(self.premove)
-                    self.update_board()
-                    self.premove = None
-                    if self.board.is_game_over():
-                        result = self.board.result()
-                        self.message.config(text=f"Game Over: {result}")
-                    else:
-                        self.message.config(text="AI's move")
-                        self.start_ai_move()
+                self.message.config(text="AI did not find a move.")
             self.ai_busy = False
-
+    
     def ai_move(self):
-        start_time = time.time()
-        best_move = self.select_best_move(board=self.board, max_depth=3)  # Adjust max_depth as needed
-        end_time = time.time()
-        self.queue.put((start_time, best_move))
-        print(f"AI move time: {end_time - start_time:.2f} seconds")
-
-    def select_best_move(self, board, max_depth=3):
-        best_move = None
-        for depth in range(1, max_depth + 1):
-            print(f"Searching at depth {depth}")
-            current_best_move = self.iterative_deepening_search(board, depth)
-            if current_best_move:
-                best_move = current_best_move
-        return best_move
-
-    def iterative_deepening_search(self, board, depth):
-        best_eval = -float('inf')
-        best_move = None
-        # Prioritize PV move if available
-        ordered_moves = []
-        if board.fen() in pv_table:
-            pv_move = pv_table[board.fen()]
-            if pv_move in board.legal_moves:
-                ordered_moves = [pv_move] + [m for m in self.order_moves(board) if m != pv_move]
-        else:
-            ordered_moves = self.order_moves(board)
-
-        for move in ordered_moves:
-            board.push(move)
-            eval_score = minimax_evaluate_helper(board, depth - 1, -float('inf'), float('inf'), False, self.transposition_table)
-            board.pop()
-            if eval_score > best_eval:
-                best_eval = eval_score
-                best_move = move
-        if best_move:
-            # Update history and PV tables
-            history_table[best_move] += 1
-            pv_table[board.fen()] = best_move
-        return best_move
-
-    def order_moves(self, board):
-        ordered_moves = []
-        for move in board.legal_moves:
-            if board.is_capture(move):
-                ordered_moves.insert(0, move)  # Prioritize captures
-            elif board.gives_check(move):
-                ordered_moves.insert(0, move)  # Prioritize checks
-            else:
-                ordered_moves.append(move)
-        # Further prioritize based on history heuristic
-        ordered_moves.sort(key=lambda move: history_table[move], reverse=True)
-        return ordered_moves
+        best_move = self.ai.select_best_move(board=self.board)
+        self.queue.put(best_move)
 
 if __name__ == "__main__":
-    # Initialize the model for the main process
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = ChessNet()
-    try:
-        checkpoint = torch.load(MODEL_PATH, map_location=device)
-        if 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
-        else:
-            state_dict = checkpoint
-        model.load_state_dict(state_dict)
-        model.to(device)
-        print("Model loaded successfully")
-    except FileNotFoundError:
-        messagebox.showerror("Error", "Model file not found. Ensure chess_model+.pth is in the program directory.")
-        exit()
-    
-    # Define model_instance globally
-    global model_instance
-    model_instance = model  # Assign the loaded model to model_instance
-    
+    initialize_model(device)
+    ai = ChessAI(device)
     root = tk.Tk()
-    app = ChessGUI(model, root)
+    app = ChessGUI(ai, root)
     root.mainloop()

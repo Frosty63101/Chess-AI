@@ -525,7 +525,7 @@ def periodic_evaluation(ai: ChessAI, episodes: int = 3, skill_level: int = 10):
                 board.push(best_move)
 
                 # Collect data
-                state = board_to_tensor(board).unsqueeze(0)
+                state = board_to_tensor(board).unsqueeze(0).to(device)
                 # Get Stockfish evaluation
                 stockfish.set_fen_position(board.fen())
                 stockfish_eval = stockfish.get_evaluation()
@@ -537,7 +537,7 @@ def periodic_evaluation(ai: ChessAI, episodes: int = 3, skill_level: int = 10):
                     stockfish_value = 0.0
                 # Adjust evaluation from the AI's perspective
                 stockfish_value = max(min(stockfish_value, MAX_EVAL), MIN_EVAL)
-                target_eval = torch.tensor([stockfish_value], dtype=torch.float32)
+                target_eval = torch.tensor([stockfish_value], dtype=torch.float32).to(device)
 
                 # Store the experience
                 evaluation_memory.append((state, target_eval))
@@ -555,7 +555,7 @@ def periodic_evaluation(ai: ChessAI, episodes: int = 3, skill_level: int = 10):
                     break
 
                 # Collect data
-                state = board_to_tensor(board).unsqueeze(0)
+                state = board_to_tensor(board).unsqueeze(0).to(device)
                 # Get Stockfish evaluation
                 stockfish.set_fen_position(board.fen())
                 stockfish_eval = stockfish.get_evaluation()
@@ -568,7 +568,7 @@ def periodic_evaluation(ai: ChessAI, episodes: int = 3, skill_level: int = 10):
                 # Adjust evaluation from the AI's perspective (since it's the opponent's move)
                 stockfish_value = -stockfish_value
                 stockfish_value = max(min(stockfish_value, MAX_EVAL), MIN_EVAL)
-                target_eval = torch.tensor([stockfish_value], dtype=torch.float32)
+                target_eval = torch.tensor([stockfish_value], dtype=torch.float32).to(device)
 
                 # Store the experience
                 evaluation_memory.append((state, target_eval))
@@ -654,7 +654,10 @@ def train(
         if 'performance_history' in checkpoint and checkpoint['performance_history'] is not None:
             performance_history.extend(checkpoint['performance_history'])
         if 'replay_buffer' in checkpoint and checkpoint['replay_buffer'] is not None:
-            replay_buffer.extend(checkpoint['replay_buffer'])
+            # Move tensors to the correct device
+            replay_buffer.extend([
+                (state.to(device), target.to(device)) for state, target in checkpoint['replay_buffer']
+            ])
         start_episode = len(loss_history)
         print(f"Resuming training from episode {start_episode + 1}.")
     else:
@@ -700,12 +703,12 @@ def train(
             if len(replay_buffer) >= batch_size:
                 batch = random.sample(replay_buffer, batch_size)
                 states, targets = zip(*batch)
-                states = torch.cat(states).to(device)
+                states = torch.cat([s.to(device) for s in states])
                 targets = torch.stack([t.to(device) for t in targets])
 
                 optimizer.zero_grad()
-                with autocast('cuda'):  # Enable autocast for mixed precision
-                    _, outputs = model(states)
+                with autocast('cuda'):
+                    _, outputs = model(states)  # Now 'states' is a tensor of shape (batch_size, 13, 8, 8)
                     loss = criterion(outputs, targets)
                 scaler.scale(loss).backward()  # Scale loss for backprop
                 scaler.step(optimizer)          # Step optimizer
@@ -776,7 +779,8 @@ def train(
                 target_eval = torch.tensor([combined_value], dtype=torch.float32).to(device)
 
                 # Store the experience
-                episode_memory.append((board_to_tensor(board).unsqueeze(0), target_eval))
+                state = board_to_tensor(board).unsqueeze(0).to(device)
+                episode_memory.append((state, target_eval))
 
                 if board.is_game_over() or len(episode_memory) >= batch_size:
                     break
@@ -822,7 +826,8 @@ def train(
                 target_eval = torch.tensor([combined_value], dtype=torch.float32).to(device)
 
                 # Store the experience
-                episode_memory.append((board_to_tensor(board).unsqueeze(0), target_eval))
+                state = board_to_tensor(board).unsqueeze(0).to(device)
+                episode_memory.append((state, target_eval))
 
                 if board.is_game_over() or len(episode_memory) >= batch_size:
                     break
@@ -834,7 +839,7 @@ def train(
         if len(replay_buffer) >= batch_size:
             batch = random.sample(replay_buffer, batch_size)
             states, targets = zip(*batch)
-            states = torch.cat(states).to(device)
+            states = torch.cat([s.to(device) for s in states])
             targets = torch.stack([t.to(device) for t in targets])
             
             optimizer.zero_grad()

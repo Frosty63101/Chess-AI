@@ -1177,7 +1177,7 @@ def play_against_model(ai: ChessAI):
     # Load piece images
     piece_images = {}
     pieces = ['P', 'N', 'B', 'R', 'Q', 'K',
-              'p', 'n', 'b', 'r', 'q', 'k']
+                'p', 'n', 'b', 'r', 'q', 'k']
     for piece in pieces:
         if piece.isupper():
             filename = os.path.join(IMAGE_DIR, f"{piece}.png")
@@ -1245,8 +1245,10 @@ def play_against_model(ai: ChessAI):
 
     def on_click(event):
         nonlocal selected_square, move_number
-        file, rank = event.x // 50, 7 - (event.y // 50)
-        square = chess.square(file, rank)
+        file = event.x // 50
+        rank = event.y // 50
+        actual_rank = 7 - rank
+        square = chess.square(file, actual_rank)
         removeHighlightedSquare()
         if selected_square is None:
             piece = board.piece_at(square)
@@ -1302,13 +1304,16 @@ def play_against_model(ai: ChessAI):
                     messagebox.showinfo("Game Over", f"Game over: {result}")
                     game_window.destroy()
                     return
+                update_board()
 
                 # AI's turn
                 ai_move()
             else:
                 messagebox.showinfo("Invalid Move", "This move is not allowed.")
             selected_square = None
+            removeHighlightedSquare()
             update_board()
+
 
     def on_right_click(event):
         nonlocal selected_square
@@ -1351,8 +1356,8 @@ def play_against_model(ai: ChessAI):
         chosen_move = ai.select_best_move(board)  # Adjust depth as needed
         if chosen_move is None:
             chosen_move = random.choice(list(board.legal_moves))
+        move_san = board.san(chosen_move)  # Get SAN before pushing the move
         board.push(chosen_move)
-        move_san = board.san(chosen_move)
         moves_san.append(move_san)
         boards.append(board.fen())
         update_board()
@@ -1388,6 +1393,7 @@ def play_against_model(ai: ChessAI):
             messagebox.showinfo("Game Over", f"Game over: {result}")
             game_window.destroy()
             return
+
 
     def on_move_click(event):
         """Handles clicking on a move in the move list to jump to that position."""

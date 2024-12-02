@@ -39,12 +39,12 @@ print(chess.__version__)
 MODEL_PATH = "chess_model.pth"
 BACKUP_MODEL_PATH = "backup_models/"
 STOCKFISH_DEFAULT_PATH = "stockfish-windows-x86-64-avx2\\stockfish\\stockfish-windows-x86-64-avx2.exe"  # Update this path as needed
-IMAGE_DIR = "images"  # Directory containing piece images
-ACTION_SIZE = 4672  # Total possible moves in our action space
-MIN_EVAL = -10.0  # Defined min evaluation
-MAX_EVAL = 10.0   # Defined max evaluation
-MAX_DEPTH = 100   # Maximum depth for killer moves
-MAX_TIME = 1.0    # Max time in seconds for move selection
+IMAGE_DIR = "images" # Directory containing piece images
+ACTION_SIZE = 4672 # Total possible moves in our action space
+MIN_EVAL = -10.0 # Defined min evaluation
+MAX_EVAL = 10.0 # Defined max evaluation
+MAX_DEPTH = 100 # Maximum depth for killer moves
+MAX_TIME = 1.0 # Max time in seconds for move selection
 
 # Global model instance
 model_instance = None  # Will be initialized in main()
@@ -188,7 +188,6 @@ def evaluate_board(board: chess.Board, ai: 'ChessAI') -> float:
         _, value = ai.model(state)  # type: ignore
         nn_eval = value.item()
 
-    # Clamp neural network evaluation between -10 and 10
     nn_eval = max(min(nn_eval, MAX_EVAL), MIN_EVAL)
 
     # Combine evaluations
@@ -288,7 +287,6 @@ class ChessAI:
             "UCI_Elo": 1350  # Adjust as needed
         })
 
-        # Initialize history and PV tables
         self.pv_table: Dict[str, chess.Move] = {}
         self.history_table: Dict[chess.Move, int] = defaultdict(int)
         self.model = model_instance
@@ -358,12 +356,9 @@ class ChessAI:
         for move in moves:
             idx = move_to_index(move)
             score = policy[idx]
-            # Add history heuristic
             score += self.history_table.get(move, 0)
-            # Add killer move bonus
             if move in self.killer_moves[depth]:
                 score += 10000
-            # Use MVV/LVA for captures
             if board.is_capture(move):
                 captured_piece = board.piece_at(move.to_square)
                 attacker_piece = board.piece_at(move.from_square)
@@ -510,7 +505,6 @@ def periodic_evaluation(ai: ChessAI, episodes: int = 3, skill_level: int = 10):
     draw_count = 0
     loss_count = 0
 
-    # Initialize a list to store training data
     evaluation_memory = []
 
     for _ in range(episodes):
@@ -524,9 +518,7 @@ def periodic_evaluation(ai: ChessAI, episodes: int = 3, skill_level: int = 10):
                     best_move = random.choice(list(board.legal_moves))
                 board.push(best_move)
 
-                # Collect data
                 state = board_to_tensor(board).unsqueeze(0).to(device)
-                # Get Stockfish evaluation
                 stockfish.set_fen_position(board.fen())
                 stockfish_eval = stockfish.get_evaluation()
                 if stockfish_eval['type'] == 'cp':
@@ -708,11 +700,11 @@ def train(
 
                 optimizer.zero_grad()
                 with autocast('cuda'):
-                    _, outputs = model(states)  # Now 'states' is a tensor of shape (batch_size, 13, 8, 8)
+                    _, outputs = model(states)
                     loss = criterion(outputs, targets)
-                scaler.scale(loss).backward()  # Scale loss for backprop
-                scaler.step(optimizer)          # Step optimizer
-                scaler.update()                 # Update scaler
+                scaler.scale(loss).backward() # Scale loss for backprop
+                scaler.step(optimizer) # Step optimizer
+                scaler.update() # Update scaler
 
                 scheduler.step(loss)
 
@@ -846,9 +838,9 @@ def train(
             with autocast('cuda'):  # Enable autocast for mixed precision
                 _, outputs = model(states)
                 loss = criterion(outputs, targets)
-            scaler.scale(loss).backward()  # Scale loss for backprop
-            scaler.step(optimizer)          # Step optimizer
-            scaler.update()                 # Update scaler
+            scaler.scale(loss).backward() # Scale loss for backprop
+            scaler.step(optimizer) # Step optimizer
+            scaler.update() # Update scaler
             
             scheduler.step(loss)
             
@@ -1002,8 +994,6 @@ def play_against_stockfish(ai: ChessAI, skill_level: int = 10):
             moves_san.append(move_san)
             boards.append(board.fen())
 
-            # Get evaluations
-            # Model evaluation
             state = board_to_tensor(board).unsqueeze(0).to(device)
             with torch.no_grad():
                 _, value = model_instance(state)  # type: ignore
@@ -1054,8 +1044,6 @@ def play_against_stockfish(ai: ChessAI, skill_level: int = 10):
                 moves_san.append(move_san)
                 boards.append(board.fen())
 
-                # Get evaluations
-                # Model evaluation
                 state = board_to_tensor(board).unsqueeze(0).to(device)
                 with torch.no_grad():
                     _, value = model_instance(state)  # type: ignore
@@ -1442,11 +1430,11 @@ class RedirectText:
             self.log_queue.put(message+'\n')
 
     def flush(self):
-        pass  # No need to implement flush for this use-case
+        pass # Not needed
 
 def main():
     """Main function to initialize the Chess AI Trainer GUI."""
-    stockfish_path = STOCKFISH_DEFAULT_PATH  # Update to your Stockfish path if needed
+    stockfish_path = STOCKFISH_DEFAULT_PATH 
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     initialize_model(device)

@@ -10,3 +10,4 @@ dist/play.exe
 epsilon_start.txt
 stockfish_skill.txt
 backup_models
+stockfish-windows-x86-64-avx2/*

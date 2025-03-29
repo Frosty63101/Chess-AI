@@ -186,8 +186,11 @@ def playAgainstStockfish(ai: ChessAI, skillLevel: int = 10):
                 if fishEval['type'] == 'cp':
                     stockfishEval = fishEval['value'] / 100.0
                 elif fishEval['type'] == 'mate':
-                    stockfishEval = (fishEval['value'] / abs(fishEval['value'])) * 10.0
-
+                    if abs(fishEval['value']) != 0:
+                        stockfishEval = (fishEval['value'] / abs(fishEval['value'])) * 10.0
+                    else:
+                        stockfishEval = 0.0
+                
                 stockfishEvalLabel.config(text=f"Stockfish Eval: {stockfishEval:.2f}")
                 aiEvalLabel.config(text=f"AI Eval: {modelEval:.2f}")
 
@@ -570,6 +573,17 @@ def main():
     canvasPerf = FigureCanvasTkAgg(figPerf, master=plotFrame)
     canvasPerf.draw()
     canvasPerf.get_tk_widget().pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+    
+    # Setup average loss plot
+    figAvgLoss, axAvgLoss = plt.subplots(figsize=(4, 3))
+    axAvgLoss.set_title("Average Loss (Rolling)")
+    axAvgLoss.set_xlabel("Episode")
+    axAvgLoss.set_ylabel("Average Loss")
+    axAvgLoss.grid(True)
+    canvasAvgLoss = FigureCanvasTkAgg(figAvgLoss, master=plotFrame)
+    canvasAvgLoss.draw()
+    canvasAvgLoss.get_tk_widget().pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
 
     logQueue = queue.Queue()
     logText = tk.Text(logFrame, wrap='word', height=10, state='disabled', bg='white')
@@ -626,6 +640,29 @@ def main():
             axPerf.plot(range(len(losses)), losses, label='Losses')
             axPerf.legend()
             canvasPerf.draw()
+        
+        # Update average loss plot (rolling window)
+        if lossHistory:
+            axAvgLoss.cla()
+            axAvgLoss.set_title("Average Loss (Rolling)")
+            axAvgLoss.set_xlabel("Episode")
+            axAvgLoss.set_ylabel("Average Loss")
+            axAvgLoss.grid(True)
+
+            windowSize = 20  # You can adjust this
+            if len(lossHistory) >= windowSize:
+                avgLoss = [
+                    sum(lossHistory[i-windowSize:i]) / windowSize
+                    for i in range(windowSize, len(lossHistory) + 1)
+                ]
+                axAvgLoss.plot(range(windowSize, len(lossHistory)+1), avgLoss, label="Avg Loss")
+                axAvgLoss.legend()
+            else:
+                axAvgLoss.plot(lossHistory, label="Avg Loss (raw)")
+                axAvgLoss.legend()
+
+            canvasAvgLoss.draw()
+
 
         # Keep polling until user closes or training ends
         if trainingThread is not None and trainingThread.is_alive():

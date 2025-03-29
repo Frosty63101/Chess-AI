@@ -34,6 +34,6 @@ MAX_EVAL = 10.0
 MAX_DEPTH = 100
 
 # Max time in seconds for move selection
-MAX_TIME = 1.0
+MAX_TIME = 3.0
 
 # If your system has a GPU, we will prefer using "cuda" automatically in the code

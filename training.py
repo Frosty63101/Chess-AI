@@ -18,6 +18,7 @@ from collections import deque
 from typing import Optional
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 import csv
 import io
 
@@ -30,16 +31,11 @@ from stockfish import Stockfish
 from torch.amp.autocast_mode import autocast
 from torch.amp.grad_scaler import GradScaler
 
-def periodicEvaluation(ai: ChessAI, episodes: int = 3, skillLevel: int = 10):
-    """
-    Evaluate the AI's performance against Stockfish for a small number of games.
-    Collect experience for training. Return (wins, draws, losses, experience).
-    """
+def periodicEvaluation(ai: ChessAI, episodes: int = 3, skillLevel: int = 20):
     stockfish = ai.stockfish
     stockfish.set_skill_level(skillLevel)
     device = ai.device
 
-    # We'll keep the model in eval mode to avoid training-time overhead
     ai.model.eval()
 
     winCount, drawCount, lossCount = 0, 0, 0
@@ -47,7 +43,6 @@ def periodicEvaluation(ai: ChessAI, episodes: int = 3, skillLevel: int = 10):
 
     for _ in range(episodes):
         board = chess.Board()
-        # Always let the AI be White, Stockfish be Black
         board.turn = chess.WHITE
 
         while not board.is_game_over():
@@ -57,16 +52,10 @@ def periodicEvaluation(ai: ChessAI, episodes: int = 3, skillLevel: int = 10):
                     bestMove = random.choice(list(board.legal_moves))
                 board.push(bestMove)
 
-                # Gather state/target
                 state = boardToTensor(board).unsqueeze(0).to(device)
                 stockfish.set_fen_position(board.fen())
                 fishEval = stockfish.get_evaluation()
-                if fishEval['type'] == 'cp':
-                    fishVal = fishEval['value'] / 100.0
-                elif fishEval['type'] == 'mate':
-                    fishVal = np.sign(fishEval['value']) * 10.0
-                else:
-                    fishVal = 0.0
+                fishVal = fishEval['value'] / 100.0 if fishEval['type'] == 'cp' else np.sign(fishEval['value']) * 10.0
                 fishVal = max(min(fishVal, MAX_EVAL), MIN_EVAL)
                 targetEval = torch.tensor([fishVal], dtype=torch.float32).to(device)
                 evaluationMemory.append((state, targetEval))
@@ -77,21 +66,14 @@ def periodicEvaluation(ai: ChessAI, episodes: int = 3, skillLevel: int = 10):
                 stockfish.set_fen_position(board.fen())
                 fishMove = stockfish.get_best_move()
                 if fishMove:
-                    fishMoveObj = chess.Move.from_uci(fishMove)
-                    board.push(fishMoveObj)
+                    board.push(chess.Move.from_uci(fishMove))
                 else:
                     break
 
                 state = boardToTensor(board).unsqueeze(0).to(device)
                 stockfish.set_fen_position(board.fen())
                 fishEval = stockfish.get_evaluation()
-                if fishEval['type'] == 'cp':
-                    fishVal = fishEval['value'] / 100.0
-                elif fishEval['type'] == 'mate':
-                    fishVal = np.sign(fishEval['value']) * 10.0
-                else:
-                    fishVal = 0.0
-                # Because it's the opponent's move, from AI's perspective, invert sign
+                fishVal = fishEval['value'] / 100.0 if fishEval['type'] == 'cp' else np.sign(fishEval['value']) * 10.0
                 fishVal = -fishVal
                 fishVal = max(min(fishVal, MAX_EVAL), MIN_EVAL)
                 targetEval = torch.tensor([fishVal], dtype=torch.float32).to(device)
@@ -114,7 +96,7 @@ def periodicEvaluation(ai: ChessAI, episodes: int = 3, skillLevel: int = 10):
     ai.pvTable.clear()
     ai.historyTable.clear()
 
-    return winCount, drawCount, lossCount, evaluationMemory
+    return winCount, drawCount, lossCount
 
 def randomChunkCsv(csvFilePath, chunkSize=10000, encoding='utf-8', seed=None):
     """
@@ -194,123 +176,75 @@ def parseSampledCsvLines(sampleLines, header):
 
 def puzzleToTrainingExamples(row, ai, maxPositions=5):
     """
-    Given one puzzle row from the CSV, create a list of (stateTensor, targetEvalTensor) pairs
-    by stepping through the puzzle's moves.
-    
-    :param row: A dict with keys like:
-        {
-          'PuzzleId': ...,
-          'FEN': ...,
-          'Moves': "e8d7 a2e6 d7d8 f7f8",  # space-separated UCI moves
-          'Rating': ...,
-          'RatingDeviation': ...,
-          'Popularity': ...,
-          'NbPlays': ...,
-          'Themes': ...,
-          'GameUrl': ...,
-          'OpeningTags': ...
-        }
-    :param ai: Your ChessAI instance (so we can access its Stockfish, device, etc.)
-    :param maxPositions: The maximum number of positions from the puzzle we want to store
-    
-    Returns: a list of (state, targetEval) suitable for your replay buffer.
+    Converts a Lichess puzzle row into training examples using the given moves
+    without relying on Stockfish evaluations.
+
+    Each training example is a (stateTensor, targetEvalTensor) pair.
+    The target is fixed (+1 for White's good move, -1 for Black's), with optional noise.
+
+    Parameters:
+    - row: A dictionary representing one puzzle.
+    - ai: The ChessAI instance (for device).
+    - maxPositions: Max number of positions to extract from the puzzle.
+
+    Returns:
+    - A list of (stateTensor, targetEvalTensor) tuples.
     """
     print(f"Processing puzzle: {row['PuzzleId']} with FEN: {row['FEN']} and moves: {row['Moves']}")
-
-    # Prepare to store (state, targetEval) pairs
     examples = []
-    
-    # 1) Extract puzzle data
+
     fen = row['FEN']
-    movesStr = row['Moves']  # e.g. "e8d7 a2e6 d7d8 f7f8"
-    
-    # 2) Create the board from the puzzle FEN
+    movesStr = row['Moves']
+
     try:
         board = chess.Board(fen)
     except ValueError:
-        # If the FEN is invalid, just return empty
-        return examples
-    
-    # Split the puzzle's moves by space
+        return examples  # Skip puzzles with invalid FEN
+
     moveUcis = movesStr.strip().split()
-    
-    # 3) For each move in the puzzle, do:
-    #    - Convert board to a state tensor
-    #    - Evaluate with Stockfish
-    #    - Append (state, targetEval) to examples
-    #    - Push the move on the board
     device = ai.device
+
     moveCount = 0
-    
     for moveUci in moveUcis:
         if moveCount >= maxPositions or board.is_game_over():
             break
-        
-        # Convert current position to a state
+
+        # Convert board to input tensor before applying the move
         stateTensor = boardToTensor(board).unsqueeze(0).to(device)
-        
-        # Evaluate with Stockfish
-        ai.stockfish.set_fen_position(board.fen())
-        fishEval = ai.stockfish.get_evaluation()
-        
-        if fishEval['type'] == 'cp':
-            fishVal = fishEval['value'] / 100.0
-        elif fishEval['type'] == 'mate':
-            # clamp to ±10.0 if it's a mate
-            fishVal = np.sign(fishEval['value']) * 10.0
-        else:
-            fishVal = 0.0
-        
-        # Optionally you can incorporate a material bonus or keep it pure
-        # fishVal += materialEvaluation(board)
-        
-        # clamp final value
-        fishVal = max(min(fishVal, 10.0), -10.0)
-        
-        targetEvalTensor = torch.tensor([fishVal], dtype=torch.float32).to(device)
-        
-        # Add (state, targetEval) to examples
-        examples.append((stateTensor, targetEvalTensor))
-        
-        # Attempt to push the next puzzle move onto the board
+
+        # Determine target value based on side to move
+        baseValue = 1.0 if board.turn == chess.WHITE else -1.0
+        noise = random.uniform(-0.05, 0.0)  # Slight noise to prevent overfitting
+        targetValue = baseValue + noise
+        targetEvalTensor = torch.tensor([targetValue], dtype=torch.float32).to(device)
+
+        # Try applying the move
         try:
-            moveObj = chess.Move.from_uci(moveUci)
+            moveObj = chess.Move.from_uci(moveUci.strip())
             if moveObj not in board.legal_moves:
-                # If not legal, puzzle might be malformed or there's a mismatch
                 break
+            policyTargetIndex = moveToIndex(moveObj)
+            policyTargetTensor = torch.tensor([policyTargetIndex], dtype=torch.long).to(device)
+            examples.append((stateTensor, targetEvalTensor, policyTargetTensor, 0))
             board.push(moveObj)
         except ValueError:
-            # Invalid UCI notation
             break
-        
+
         moveCount += 1
-    
+
     return examples
 
-def train(
-    ai: ChessAI,
-    episodes: int = 1000,
-    lr: float = 0.0001,
-    stopEvent: Optional[any] = None,
-    currentLoss: Optional[list] = None,
-    currentEpisode: Optional[list] = None,
-    evaluationInterval: int = 25,
-    batchSize: int = 128,
-    bufferSize: int = 50000,
-    lossHistory: Optional[list] = None,
-    performanceHistory: Optional[list] = None,
-    chunkInterval=10,
-    csvFilePath='lichess_db_puzzle.csv\lichess_db_puzzle.csv',
-    chunkSize=100,
-):
-    """
-    Main training loop that uses Stockfish to generate experiences for the AI,
-    then periodically trains the net on those experiences.
-    """
-    device = ai.device
-    model = ai.model
-    model.to(device)
+def train(ai: ChessAI, episodes: int = 1000, lr: float = 0.0001,
+          stopEvent: Optional[any] = None, currentLoss: Optional[list] = None,
+          currentEpisode: Optional[list] = None, evaluationInterval: int = 25,
+          batchSize: int = 128, bufferSize: int = 50000,
+          lossHistory: Optional[list] = None,
+          performanceHistory: Optional[list] = None,
+          csvFilePath: str = "lichess_db_puzzle.csv\lichess_db_puzzle.csv",
+          chunkSize: int = 1000, maxSampleAge: int = 100):
 
+    device = ai.device
+    model = ai.model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=10)
     criterion = nn.SmoothL1Loss()
@@ -322,209 +256,119 @@ def train(
         performanceHistory = []
 
     replayBuffer = deque(maxlen=bufferSize)
-
-    # Possibly load states if continuing training
     startEpisode = 0
+
     if os.path.exists(MODEL_PATH):
         checkpoint = torch.load(MODEL_PATH, map_location=device)
-        if 'optimizer_state_dict' in checkpoint and checkpoint['optimizer_state_dict']:
+        if 'optimizer_state_dict' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            print("Optimizer state loaded.")
-        if 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict']:
+        if 'scheduler_state_dict' in checkpoint:
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            print("Scheduler state loaded.")
-        if 'loss_history' in checkpoint and checkpoint['loss_history']:
+        if 'loss_history' in checkpoint:
             lossHistory.extend(checkpoint['loss_history'])
-        if 'performance_history' in checkpoint and checkpoint['performance_history']:
+        if 'performance_history' in checkpoint:
             performanceHistory.extend(checkpoint['performance_history'])
-        if 'replay_buffer' in checkpoint and checkpoint['replay_buffer']:
-            for st, tv in checkpoint['replay_buffer']:
-                # Move them to GPU
-                replayBuffer.append((st.to(device), tv.to(device)))
+        if 'replay_buffer' in checkpoint:
+            for st, tv, policyTarget, age in checkpoint['replay_buffer']:
+                replayBuffer.append((st.to(device), tv.to(device), policyTarget, age))
         startEpisode = len(lossHistory)
         print(f"Resuming training from episode {startEpisode + 1}.")
 
-    # Possibly load skill
-    stockfishSkill = ai.getStockfishSkill()
-    print(f"Current Stockfish skill: {stockfishSkill}")
-
     for episodeIndex in range(startEpisode, episodes + startEpisode):
-        # If user requests stop
-        if stopEvent is not None and stopEvent.is_set():
+        if stopEvent and stopEvent.is_set():
             ai.saveModel(optimizer, scheduler, lossHistory, performanceHistory, replayBuffer)
-            print(f"Training stopped by user. Model saved to {MODEL_PATH}")
+            print("Training stopped by user.")
             return
-
-        # --- New: randomly vary Stockfish skill every X episodes ---
-        if episodeIndex % 50 == 0 and episodeIndex != 0:
-            newSkill = random.randint(1, 20)
-            ai.setStockfishSkill(newSkill)
-            print(f"Randomly set Stockfish skill to {newSkill} for variety.")
 
         timeStart = time.perf_counter()
 
-        # Periodic evaluation
-        if (episodeIndex + 1) % evaluationInterval == 0:
-            ai.periodicallySaveModel(
-                optimizer, scheduler,
-                lossHistory, performanceHistory,
-                replayBuffer
-            )
-            print("=== Periodic Backup Saved ===")
+        # Dynamic noise decay
+        noiseLevel = max(0.05 * (1 - episodeIndex / episodes), 0.005)
 
-            w, d, l, evaluationMemory = periodicEvaluation(ai, episodes=3, skillLevel=stockfishSkill)
-            performanceHistory.append((w, d, l))
-            replayBuffer.extend(evaluationMemory)
-
-            # Training step
-            if len(replayBuffer) >= batchSize:
-                batch = random.sample(replayBuffer, batchSize)
-                states, targets = zip(*batch)
-                states = torch.cat([s for s in states]).to(device)
-                targets = torch.stack([t for t in targets]).to(device)
-
-                optimizer.zero_grad()
-                with autocast('cuda'):
-                    _, outputs = model(states)
-                    loss = criterion(outputs, targets)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step(loss)
-                if currentLoss is not None:
-                    currentLoss[0] = loss.item()
-                lossHistory.append(loss.item())
-            else:
-                loss = None
-
-            if currentEpisode is not None:
-                currentEpisode[0] = episodeIndex + 1
-
-            timeEnd = time.perf_counter()
-            if loss is not None:
-                print(f"Episode {episodeIndex + 1}/{episodes + startEpisode} - Loss: {loss.item():.4f} - Time: {timeEnd - timeStart:.2f}s")
-            else:
-                print(f"Episode {episodeIndex + 1}/{episodes + startEpisode} - Loss: N/A - Time: {timeEnd - timeStart:.2f}s")
-
-            continue
+        episodeMemory = []
+        board = chess.Board()
         
-        if (episodeIndex + 1) % chunkInterval == 0:
-            print(f"[Episode {episodeIndex+1}] Reading random CSV chunk of size {chunkSize}")
+        if random.random() < 0.3 and episodeIndex>50:  # 30% chance
             sampleLines, header = randomChunkCsv(csvFilePath, chunkSize=chunkSize)
             parsedRows = parseSampledCsvLines(sampleLines, header)
-
-            # Now convert those rows to training examples. For puzzles, for example:
             for row in parsedRows:
                 puzzleExamples = puzzleToTrainingExamples(row, ai, maxPositions=5)
                 replayBuffer.extend(puzzleExamples)
-
-            print(f"Replay buffer size after chunk: {len(replayBuffer)}")
-
-        # Otherwise, run "self-play" with Stockfish for data
-        episodeMemory = []
-        while len(episodeMemory) < batchSize:
-            board = chess.Board()
-            while not board.is_game_over():
-                # White = Stockfish
+        else:
+            while not board.is_game_over() and len(episodeMemory) < batchSize:
                 ai.stockfish.set_fen_position(board.fen())
                 fishMove = ai.stockfish.get_best_move()
-                if fishMove:
-                    moveObj = chess.Move.from_uci(fishMove)
-                else:
-                    moveObj = random.choice(list(board.legal_moves))
+                if not fishMove:
+                    break
+                moveObj = chess.Move.from_uci(fishMove)
+
+                # Convert board to tensor and get policy index
+                state = boardToTensor(board).unsqueeze(0).to(device)
+                policyTargetIndex = moveToIndex(moveObj)
+
                 board.push(moveObj)
 
-                fen = board.fen()
-                ai.stockfish.set_fen_position(fen)
-                fishEval = ai.stockfish.get_evaluation()
-                if fishEval['type'] == 'cp':
-                    fishVal = fishEval['value'] / 100.0
-                elif fishEval['type'] == 'mate':
-                    fishVal = np.sign(fishEval['value']) * 10.0
-                else:
-                    fishVal = 0.0
-                fishVal = max(min(fishVal, MAX_EVAL), MIN_EVAL)
-
-                # If it's black to move, from perspective of black we invert
-                if board.turn == chess.BLACK:
-                    fishVal = -fishVal
-
-                combinedValue = fishVal + materialEvaluation(board)
-                combinedValue = max(min(combinedValue, MAX_EVAL), MIN_EVAL)
-                targetEval = torch.tensor([combinedValue], dtype=torch.float32).to(device)
-
                 state = boardToTensor(board).unsqueeze(0).to(device)
-                episodeMemory.append((state, targetEval))
-
-                if board.is_game_over() or len(episodeMemory) >= batchSize:
-                    break
-
-                # Black = Stockfish
                 ai.stockfish.set_fen_position(board.fen())
-                fishMove = ai.stockfish.get_best_move()
-                if fishMove:
-                    moveObj = chess.Move.from_uci(fishMove)
-                else:
-                    moveObj = random.choice(list(board.legal_moves))
-                board.push(moveObj)
-
-                fen = board.fen()
-                ai.stockfish.set_fen_position(fen)
                 fishEval = ai.stockfish.get_evaluation()
-                if fishEval['type'] == 'cp':
-                    fishVal = fishEval['value'] / 100.0
-                elif fishEval['type'] == 'mate':
-                    fishVal = np.sign(fishEval['value']) * 10.0
-                else:
-                    fishVal = 0.0
+                fishVal = fishEval['value'] / 100.0 if fishEval['type'] == 'cp' else np.sign(fishEval['value']) * 10.0
+                fishVal += random.uniform(-noiseLevel, noiseLevel)
                 fishVal = max(min(fishVal, MAX_EVAL), MIN_EVAL)
+                target = torch.tensor([fishVal], dtype=torch.float32).to(device)
+                policyTargetTensor = torch.tensor([policyTargetIndex], dtype=torch.long).to(device)
+                episodeMemory.append((state, target, policyTargetTensor, 0))
 
-                if board.turn == chess.WHITE:
-                    fishVal = -fishVal
+            replayBuffer.extend(episodeMemory)
+        
+        agedBuffer = deque()
+        for state, valueTarget, policyTarget, age in replayBuffer:
+            if age + 1 < maxSampleAge:
+                agedBuffer.append((state, valueTarget, policyTarget, age + 1))
+        replayBuffer = agedBuffer  # Replace buffer with aged version
 
-                combinedValue = fishVal + materialEvaluation(board)
-                combinedValue = max(min(combinedValue, MAX_EVAL), MIN_EVAL)
-                targetEval = torch.tensor([combinedValue], dtype=torch.float32).to(device)
-
-                state = boardToTensor(board).unsqueeze(0).to(device)
-                episodeMemory.append((state, targetEval))
-
-                if board.is_game_over() or len(episodeMemory) >= batchSize:
-                    break
-
-        # Put the entire "episodeMemory" into the replayBuffer
-        replayBuffer.extend(episodeMemory)
-
-        # Now do the training step from the replayBuffer
         if len(replayBuffer) >= batchSize:
-            batch = random.sample(replayBuffer, batchSize)
-            states, targets = zip(*batch)
-            states = torch.cat([s for s in states]).to(device)
-            targets = torch.stack([t for t in targets]).to(device)
+            # Prioritize high-reward samples
+            weights = [abs(value.item()) for _, value, _, _ in replayBuffer]
+            batch = random.choices(replayBuffer, weights=weights, k=batchSize)
+            states, valueTargets, policyTargets, _ = zip(*batch)
+            states = torch.cat(states).to(device)
+            valueTargets = torch.stack(valueTargets).to(device)
+            policyTargets = torch.cat(policyTargets).to(device)
 
             optimizer.zero_grad()
             with autocast('cuda'):
-                _, outputs = model(states)
-                loss = criterion(outputs, targets)
-            scaler.scale(loss).backward()
+                policyOut, valueOut = model(states)
+                valueLoss = criterion(valueOut, valueTargets)
+                policyLoss = F.cross_entropy(policyOut, policyTargets)
+                combinedLoss = valueLoss + 0.5 * policyLoss  # You can tune this weight
+            scaler.scale(combinedLoss).backward()
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step(loss)
+            scheduler.step(combinedLoss)
+            newLr = lr * (0.5 ** (episodeIndex // 200))
+            for paramGroup in optimizer.param_groups:
+                paramGroup['lr'] = newLr
 
             if currentLoss is not None:
-                currentLoss[0] = loss.item()
-            lossHistory.append(loss.item())
-        else:
-            loss = None
+                currentLoss[0] = combinedLoss.item()
+            lossHistory.append(combinedLoss.item())
 
         if currentEpisode is not None:
             currentEpisode[0] = episodeIndex + 1
 
+        if (episodeIndex + 1) % evaluationInterval == 0:
+            print("Performing periodic evaluation...")
+            w, d, l = periodicEvaluation(ai)
+            performanceHistory.append((w, d, l))
+            ai.periodicallySaveModel(optimizer, scheduler, lossHistory, performanceHistory, replayBuffer)
+
         timeEnd = time.perf_counter()
-        if loss is not None:
-            print(f"Episode {episodeIndex + 1}/{episodes + startEpisode} - Loss: {loss.item():.4f} - Time: {timeEnd - timeStart:.2f}s")
-        else:
-            print(f"Episode {episodeIndex + 1}/{episodes + startEpisode} - Loss: N/A - Time: {timeEnd - timeStart:.2f}s")
+        if lossHistory:
+            if len(lossHistory) >= 10:
+                meanLoss = np.mean(lossHistory[-10:])
+                print(f"Episode {episodeIndex + 1}: Loss={combinedLoss.item():.4f}, Mean(10)={meanLoss:.4f}, Noise={noiseLevel:.4f}, Time={timeEnd - timeStart:.2f}s")
+            else:
+                print(f"Episode {episodeIndex + 1}: Loss={combinedLoss.item():.4f}, Noise={noiseLevel:.4f}, Time={timeEnd - timeStart:.2f}s")
 
     ai.saveModel(optimizer, scheduler, lossHistory, performanceHistory, replayBuffer)
     print("Training completed and model saved.")

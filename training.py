@@ -71,7 +71,6 @@ def periodicEvaluation(ai: ChessAI, episodes: int = 3, skillLevel: int = 20):
                 fishMove = stockfish.get_best_move()
                 if fishMove:
                     board.push(chess.Move.from_uci(fishMove))
-                    board.push(chess.Move.from_uci(fishMove))
                 else:
                     break
 

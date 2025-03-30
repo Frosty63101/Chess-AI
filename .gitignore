@@ -11,3 +11,4 @@ epsilon_start.txt
 backup_models
 __pycache__
 twic_pgn_files/*
+chess_model.pth

@@ -443,10 +443,13 @@ def train(ai: ChessAI, episodes: int = 1000, lr: float = 0.0001,
         replayBuffer = agedBuffer  # Replace buffer with aged version
 
         if len(replayBuffer) >= batchSize:
-            batch = random.sample(replayBuffer, batchSize)
-            states, targets = zip(*batch)
-            states = torch.cat([s for s in states]).to(device)
-            targets = torch.stack([t for t in targets]).to(device)
+            # Prioritize high-reward samples
+            weights = [abs(value.item()) for _, value, _, _ in replayBuffer]
+            batch = random.choices(replayBuffer, weights=weights, k=batchSize)
+            states, valueTargets, policyTargets, _ = zip(*batch)
+            states = torch.cat(states).to(device)
+            valueTargets = torch.stack(valueTargets).to(device)
+            policyTargets = torch.cat(policyTargets).to(device)
 
             optimizer.zero_grad()
             with autocast('cuda'):
@@ -461,10 +464,6 @@ def train(ai: ChessAI, episodes: int = 1000, lr: float = 0.0001,
             newLr = lr * (0.5 ** (episodeIndex // 200))
             for paramGroup in optimizer.param_groups:
                 paramGroup['lr'] = newLr
-            scheduler.step(combinedLoss)
-            newLr = lr * (0.5 ** (episodeIndex // 200))
-            for paramGroup in optimizer.param_groups:
-                paramGroup['lr'] = newLr
 
             if currentLoss is not None:
                 currentLoss[0] = combinedLoss.item()
@@ -472,12 +471,6 @@ def train(ai: ChessAI, episodes: int = 1000, lr: float = 0.0001,
 
         if currentEpisode is not None:
             currentEpisode[0] = episodeIndex + 1
-
-        if (episodeIndex + 1) % evaluationInterval == 0:
-            print("Performing periodic evaluation...")
-            w, d, l = periodicEvaluation(ai)
-            performanceHistory.append((w, d, l))
-            ai.periodicallySaveModel(optimizer, scheduler, lossHistory, performanceHistory, replayBuffer)
 
         if (episodeIndex + 1) % evaluationInterval == 0:
             print("Performing periodic evaluation...")

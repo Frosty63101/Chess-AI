@@ -571,7 +571,7 @@ def train(ai: ChessAI, episodes: int = 1000, lr: float = 0.0001,
                     performanceHistory = []
 
                 replayBuffer = deque(maxlen=bufferSize)
-                checkpoint = torch.load(MODEL_PATH, map_location=device, weights_only=False)
+                checkpoint = torch.load(path, map_location=device, weights_only=False)
                 if 'optimizer_state_dict' in checkpoint:
                     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 if 'scheduler_state_dict' in checkpoint:

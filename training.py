@@ -42,6 +42,10 @@ def periodicEvaluation(ai: ChessAI, episodes: int = 3, skillLevel: int = 20):
     ai.model.eval()
 
     winCount, drawCount, lossCount = 0, 0, 0
+    correctPolicyCount = 0
+    totalPolicyCount = 0
+    maxPolicyScore = 0
+
     evaluationMemory = []
 
     for _ in range(episodes):
@@ -51,6 +55,34 @@ def periodicEvaluation(ai: ChessAI, episodes: int = 3, skillLevel: int = 20):
         while not board.is_game_over():
             if board.turn == chess.WHITE:
                 bestMove = ai.selectBestMove(board)
+                # Evaluate policy accuracy
+                stateTensor = boardToTensor(board).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    policyOutput, _ = ai.model(stateTensor)
+                    policyProbs = torch.softmax(policyOutput[0], dim=0).cpu().numpy()
+
+                legalMoves = list(board.legal_moves)
+                if legalMoves:
+                    bestPredictedMove = max(legalMoves, key=lambda mv: policyProbs[moveToIndex(mv)])
+                    predictedIndex = moveToIndex(bestPredictedMove)
+
+                    # Get Stockfish's best move
+                    sfBestMoveUci = stockfish.get_best_move()
+                    if sfBestMoveUci:
+                        sfBestMove = chess.Move.from_uci(sfBestMoveUci)
+                        if sfBestMove in board.legal_moves:
+                            sfIndex = moveToIndex(sfBestMove)
+
+                            # Only now is it safe to compare!
+                            policyProbs = torch.softmax(policyOutput[0], dim=0).cpu()  # ← keep it a tensor
+                            topK = torch.topk(policyProbs, k=3).indices.numpy()
+                            if sfIndex in topK:
+                                rank = list(topK).index(sfIndex) + 1  # 1-based index
+                                credit = 1.0 / rank
+                                correctPolicyCount += credit
+                                maxPolicyScore += 1  # or sum of 1/rank for all topK if using advanced credit system
+                            totalPolicyCount += 1
+
                 if bestMove is None:
                     bestMove = random.choice(list(board.legal_moves))
                 board.push(bestMove)
@@ -58,7 +90,6 @@ def periodicEvaluation(ai: ChessAI, episodes: int = 3, skillLevel: int = 20):
                 state = boardToTensor(board).unsqueeze(0).to(device)
                 stockfish.set_fen_position(board.fen())
                 fishEval = stockfish.get_evaluation()
-                fishVal = fishEval['value'] / 100.0 if fishEval['type'] == 'cp' else np.sign(fishEval['value']) * 10.0
                 fishVal = fishEval['value'] / 100.0 if fishEval['type'] == 'cp' else np.sign(fishEval['value']) * 10.0
                 fishVal = max(min(fishVal, MAX_EVAL), MIN_EVAL)
                 targetEval = torch.tensor([fishVal], dtype=torch.float32).to(device)
@@ -96,13 +127,18 @@ def periodicEvaluation(ai: ChessAI, episodes: int = 3, skillLevel: int = 20):
             drawCount += 1
 
     print(f"[Eval vs Stockfish (Skill={skillLevel})] Wins: {winCount}, Draws: {drawCount}, Losses: {lossCount}")
+    if totalPolicyCount > 0:
+        accuracy = maxPolicyScore / totalPolicyCount
+        print(f"[Policy Accuracy vs Stockfish] {maxPolicyScore}/{totalPolicyCount} = {accuracy:.2%} with {correctPolicyCount:.2f} credit")
+    else:
+        print("[Policy Accuracy] No comparisons made.")
+
 
     ai.transpositionTable.clear()
     ai.pvTable.clear()
     ai.historyTable.clear()
 
-    return winCount, drawCount, lossCount
-    return winCount, drawCount, lossCount
+    return winCount, drawCount, lossCount, accuracy
 
 def randomChunkCsv(csvFilePath, chunkSize=10000, encoding='utf-8', seed=None):
     """
@@ -152,15 +188,11 @@ def randomChunkCsv(csvFilePath, chunkSize=10000, encoding='utf-8', seed=None):
 
         # 5) Now read up to `chunkSize` lines from here
         sampleLines = []
-        print(f"Reading from offset {offset} in file '{csvFilePath}'")  # Debug info for random sampling
         for i in range(chunkSize):
-            print(i, end='')  # Debug: show progress in reading lines
             line = f.readline()
             if not line:
                 break
             sampleLines.append(line)
-        print()  # Newline for cleaner output after reading lines
-        print("closing file")  # Debug info to show we are done reading lines
 
     return sampleLines, header
 
@@ -173,7 +205,6 @@ def parseSampledCsvLines(sampleLines, header):
           ...
         ]
     """
-    print("Parsing sampled CSV lines...")
     csvContent = header + "".join(sampleLines)
     f = io.StringIO(csvContent)
     reader = csv.DictReader(f)
@@ -209,7 +240,6 @@ def puzzleToTrainingExamples(row, ai, maxPositions=5):
     Returns:
     - A list of (stateTensor, targetEvalTensor) tuples.
     """
-    print(f"Processing puzzle: {row['PuzzleId']} with FEN: {row['FEN']} and moves: {row['Moves']}")
     examples = []
 
 
@@ -221,8 +251,6 @@ def puzzleToTrainingExamples(row, ai, maxPositions=5):
     try:
         board = chess.Board(fen)
     except ValueError:
-        return examples  # Skip puzzles with invalid FEN
-
         return examples  # Skip puzzles with invalid FEN
 
     moveUcis = movesStr.strip().split()
@@ -274,6 +302,10 @@ def puzzleToTrainingExamples(row, ai, maxPositions=5):
 
 
     return examples
+
+def moveIndexDisagrees(policyOut, targetIndex):
+    predictedIndex = torch.argmax(policyOut).item()
+    return predictedIndex != targetIndex.item()
 
 def parsePGNGames(folderPath: str, maxGames: int = 10):
     """
@@ -338,7 +370,6 @@ def train(ai: ChessAI, episodes: int = 1000, lr: float = 0.0001,
 
     device = ai.device
     model = ai.model.to(device)
-    model = ai.model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=10)
     criterion = nn.SmoothL1Loss()
@@ -354,7 +385,7 @@ def train(ai: ChessAI, episodes: int = 1000, lr: float = 0.0001,
 
 
     if os.path.exists(MODEL_PATH):
-        checkpoint = torch.load(MODEL_PATH, map_location=device)
+        checkpoint = torch.load(MODEL_PATH, map_location=device, weights_only=False)
         if 'optimizer_state_dict' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         if 'scheduler_state_dict' in checkpoint:
@@ -378,61 +409,87 @@ def train(ai: ChessAI, episodes: int = 1000, lr: float = 0.0001,
         timeStart = time.perf_counter()
 
         # Dynamic noise decay
-        noiseLevel = max(0.05 * (1 - episodeIndex / episodes), 0.005)
+        noiseLevel = max(0.03 * (1 - episodeIndex / episodes), 0.001)
 
         episodeMemory = []
         board = chess.Board()
         
         r = random.random()
         
-        if r < 0.2 and episodeIndex > 50:
+        if r < 0.2 and episodeIndex > 20:
             # 20% chance - sample full games from PGN
-            games = parsePGNGames("twic_pgn_files", maxGames=10)
+            games = parsePGNGames("twic_pgn_files", maxGames=100)
             for game in games:
                 gameExamples = gameToTrainingExamples(game, ai, maxPositions=50)
                 replayBuffer.extend(gameExamples)
         
-        elif r < 0.5 and episodeIndex > 50:
+        elif r < 0.5 and episodeIndex > 20:
             # 30% chance total (20% PGN, 30% puzzles) - sample puzzles
             sampleLines, header = randomChunkCsv(csvFilePath, chunkSize=chunkSize)
             parsedRows = parseSampledCsvLines(sampleLines, header)
             for row in parsedRows:
                 puzzleExamples = puzzleToTrainingExamples(row, ai, maxPositions=5)
                 replayBuffer.extend(puzzleExamples)
-        else:
+        elif r >= 0.5 or episodeIndex <= 20:
+            episodeMemory = []
+
+            # --- Start from random known opening ---
+            board = chess.Board()
+            openingMoves = []
+            try:
+                openingGames = parsePGNGames("twic_pgn_files", maxGames=10)
+                openingGame = random.choice(openingGames)
+                node = openingGame
+
+                pliesToPlay = random.randint(4, 12)
+                for _ in range(pliesToPlay):
+                    if not node.variations:
+                        break
+                    move = node.variations[0].move
+                    if move in board.legal_moves:
+                        board.push(move)
+                        node = node.variations[0]
+                        openingMoves.append(move)
+                    else:
+                        break
+            except Exception as e:
+                print(f"[Opening Load Error] {e}")
+
+            # --- Now let Stockfish continue from this mid-game ---
             while not board.is_game_over() and len(episodeMemory) < batchSize:
                 ai.stockfish.set_fen_position(board.fen())
                 fishMove = ai.stockfish.get_best_move()
                 if not fishMove:
                     break
+                
                 moveObj = chess.Move.from_uci(fishMove)
-
-                # Convert board to tensor and get policy index
-                state = boardToTensor(board).unsqueeze(0).to(device)
-                policyTargetIndex = moveToIndex(moveObj)
-
-                if not fishMove:
+                if moveObj not in board.legal_moves:
                     break
-                moveObj = chess.Move.from_uci(fishMove)
+                
+                # --- 1. Convert board to tensor ---
+                stateTensor = boardToTensor(board).unsqueeze(0).to(device)
 
-                # Convert board to tensor and get policy index
-                state = boardToTensor(board).unsqueeze(0).to(device)
+                # --- 2. Policy Target: Best move index ---
                 policyTargetIndex = moveToIndex(moveObj)
+                policyTargetTensor = torch.tensor([policyTargetIndex], dtype=torch.long).to(device)
 
+                # --- 3. Push the move ---
                 board.push(moveObj)
 
-                state = boardToTensor(board).unsqueeze(0).to(device)
+                # --- 4. Get evaluation for value head ---
                 ai.stockfish.set_fen_position(board.fen())
                 fishEval = ai.stockfish.get_evaluation()
                 fishVal = fishEval['value'] / 100.0 if fishEval['type'] == 'cp' else np.sign(fishEval['value']) * 10.0
                 fishVal += random.uniform(-noiseLevel, noiseLevel)
-                fishVal = fishEval['value'] / 100.0 if fishEval['type'] == 'cp' else np.sign(fishEval['value']) * 10.0
-                fishVal += random.uniform(-noiseLevel, noiseLevel)
                 fishVal = max(min(fishVal, MAX_EVAL), MIN_EVAL)
-                target = torch.tensor([fishVal], dtype=torch.float32).to(device)
-                policyTargetTensor = torch.tensor([policyTargetIndex], dtype=torch.long).to(device)
-                episodeMemory.append((state, target, policyTargetTensor, 0))
+                targetEvalTensor = torch.tensor([fishVal], dtype=torch.float32).to(device)
 
+                # --- 5. Store the training sample ---
+                episodeMemory.append((stateTensor, targetEvalTensor, policyTargetTensor, 0))
+
+            replayBuffer.extend(episodeMemory)
+
+            
             replayBuffer.extend(episodeMemory)
         
         agedBuffer = deque()
@@ -443,7 +500,9 @@ def train(ai: ChessAI, episodes: int = 1000, lr: float = 0.0001,
 
         if len(replayBuffer) >= batchSize:
             # Prioritize high-reward samples
-            weights = [abs(value.item()) for _, value, _, _ in replayBuffer]
+            weights = [abs(value.item()) for (_, value, _, _) in replayBuffer]
+
+
             batch = random.choices(replayBuffer, weights=weights, k=batchSize)
             states, valueTargets, policyTargets, _ = zip(*batch)
             states = torch.cat(states).to(device)
@@ -453,16 +512,37 @@ def train(ai: ChessAI, episodes: int = 1000, lr: float = 0.0001,
             optimizer.zero_grad()
             with autocast('cuda'):
                 policyOut, valueOut = model(states)
+                
+                # Compute disagreement-based weights
+                with torch.no_grad():
+                    predictedIndices = torch.argmax(policyOut, dim=1)
+                    disagreements = (predictedIndices != policyTargets).float()  # 1.0 if disagree, 0.0 if agree
+                    disagreementWeights = 1.0 + disagreements  # 2.0 for disagreement, 1.0 for agreement
+
+
+                # 🔍 Top-K Policy Match Tracking
+                with torch.no_grad():
+                    topK = torch.topk(policyOut, k=5, dim=1).indices  # shape: (batch, 5)
+                    matches = (topK == policyTargets.unsqueeze(1)).any(dim=1).float()  # 1.0 if target in top-5
+                    topKMatchRate = matches.mean().item()
+                    if episodeIndex % 10 == 0:
+                        print(f"[Top-5 Policy Match Rate] {topKMatchRate:.2%}")
+
                 valueLoss = criterion(valueOut, valueTargets)
-                policyLoss = F.cross_entropy(policyOut, policyTargets)
-                combinedLoss = valueLoss + 0.5 * policyLoss  # You can tune this weight
+
+                if torch.any(policyTargets >= ACTION_SIZE) or torch.any(policyTargets < 0):
+                    print("❌ Invalid policy target index detected!")
+                    print(policyTargets)
+
+                rawPolicyLoss = F.cross_entropy(policyOut, policyTargets, reduction='none')
+                weightedPolicyLoss = (rawPolicyLoss * disagreementWeights).mean()
+                combinedLoss = (0.25 * valueLoss) + (1.75 * weightedPolicyLoss)
+
             scaler.scale(combinedLoss).backward()
             scaler.step(optimizer)
             scaler.update()
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
             scheduler.step(combinedLoss)
-            newLr = lr * (0.5 ** (episodeIndex // 200))
-            for paramGroup in optimizer.param_groups:
-                paramGroup['lr'] = newLr
 
             if currentLoss is not None:
                 currentLoss[0] = combinedLoss.item()
@@ -473,17 +553,48 @@ def train(ai: ChessAI, episodes: int = 1000, lr: float = 0.0001,
 
         if (episodeIndex + 1) % evaluationInterval == 0:
             print("Performing periodic evaluation...")
-            w, d, l = periodicEvaluation(ai)
-            performanceHistory.append((w, d, l))
-            ai.periodicallySaveModel(optimizer, scheduler, lossHistory, performanceHistory, replayBuffer)
+            w, d, l, acc = periodicEvaluation(ai)
+            performanceHistory.append((w, d, l, acc))
+            path = ai.periodicallySaveModel(optimizer, scheduler, lossHistory, performanceHistory, replayBuffer)
+            if os.path.exists(path) and ((episodeIndex + 1) % (4 * evaluationInterval) == 0):
+                print('resetting optimizer and scheduler')
+                device = ai.device
+                model = ai.model.to(device)
+                optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+                scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=10)
+                criterion = nn.SmoothL1Loss()
+                scaler = GradScaler('cuda')
+
+                if lossHistory is None:
+                    lossHistory = []
+                if performanceHistory is None:
+                    performanceHistory = []
+
+                replayBuffer = deque(maxlen=bufferSize)
+                checkpoint = torch.load(MODEL_PATH, map_location=device, weights_only=False)
+                if 'optimizer_state_dict' in checkpoint:
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                if 'scheduler_state_dict' in checkpoint:
+                    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                if 'loss_history' in checkpoint:
+                    lossHistory.clear()
+                    lossHistory.extend(checkpoint['loss_history'])
+                if 'performance_history' in checkpoint:
+                    performanceHistory.clear()
+                    performanceHistory.extend(checkpoint['performance_history'])
+                if 'replay_buffer' in checkpoint:
+                    replayBuffer.clear()
+                    for st, tv, policyTarget, age in checkpoint['replay_buffer']:
+                        replayBuffer.append((st.to(device), tv.to(device), policyTarget, age))
+                print("Model checkpoint loaded successfully.")
 
         timeEnd = time.perf_counter()
         if lossHistory:
             if len(lossHistory) >= 10:
                 meanLoss = np.mean(lossHistory[-10:])
-                print(f"Episode {episodeIndex + 1}: Loss={combinedLoss.item():.4f}, Mean(10)={meanLoss:.4f}, Noise={noiseLevel:.4f}, Time={timeEnd - timeStart:.2f}s")
+                print(f"Episode {episodeIndex + 1}: Loss={combinedLoss.item():.4f}, Value Loss={valueLoss.item():.4f}, Policy Loss={weightedPolicyLoss.item():.4f}, Mean(10)={meanLoss:.4f}, Noise={noiseLevel:.4f}, Time={timeEnd - timeStart:.2f}s")
             else:
-                print(f"Episode {episodeIndex + 1}: Loss={combinedLoss.item():.4f}, Noise={noiseLevel:.4f}, Time={timeEnd - timeStart:.2f}s")
+                print(f"Episode {episodeIndex + 1}: Loss={combinedLoss.item():.4f}, Value Loss={valueLoss.item():.4f}, Policy Loss={weightedPolicyLoss.item():.4f}, Noise={noiseLevel:.4f}, Time={timeEnd - timeStart:.2f}s")
 
     ai.saveModel(optimizer, scheduler, lossHistory, performanceHistory, replayBuffer)
     print("Training completed and model saved.")

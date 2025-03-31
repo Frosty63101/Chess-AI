@@ -668,3 +668,4 @@ class ChessAI:
         fileName = os.path.join(BACKUP_MODEL_PATH, f"{time.time()}.pth")
         torch.save(checkpoint, fileName)
         print(f"Model and state backup saved to {fileName}")
+        return fileName

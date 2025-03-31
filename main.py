@@ -583,7 +583,15 @@ def main():
     canvasAvgLoss = FigureCanvasTkAgg(figAvgLoss, master=plotFrame)
     canvasAvgLoss.draw()
     canvasAvgLoss.get_tk_widget().pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
+    
+    figAcc, axAcc = plt.subplots(figsize=(4, 3))
+    axAcc.set_title("Policy Accuracy vs Stockfish")
+    axAcc.set_xlabel("Evaluation #")
+    axAcc.set_ylabel("Accuracy")
+    axAcc.grid(True)
+    canvasAcc = FigureCanvasTkAgg(figAcc, master=plotFrame)
+    canvasAcc.draw()
+    canvasAcc.get_tk_widget().pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
     logQueue = queue.Queue()
     logText = tk.Text(logFrame, wrap='word', height=10, state='disabled', bg='white')
@@ -634,10 +642,20 @@ def main():
             axPerf.set_xlabel("Eval #")
             axPerf.set_ylabel("Count")
             axPerf.grid(True)
-            wins, draws, losses = zip(*performanceHistory)
+            # Unpack performanceHistory with accuracy
+            wins, draws, losses, accuracies = zip(*performanceHistory)
             axPerf.plot(range(len(wins)), wins, label='Wins')
             axPerf.plot(range(len(draws)), draws, label='Draws')
             axPerf.plot(range(len(losses)), losses, label='Losses')
+            axAcc.cla()
+            axAcc.set_title("Policy Accuracy vs Stockfish")
+            axAcc.set_xlabel("Evaluation #")
+            axAcc.set_ylabel("Accuracy")
+            axAcc.grid(True)
+            axAcc.plot(range(len(accuracies)), accuracies, label="Accuracy", marker='o')
+            axAcc.set_ylim(0.0, 1.0)
+            axAcc.legend()
+            canvasAcc.draw()
             axPerf.legend()
             canvasPerf.draw()
         

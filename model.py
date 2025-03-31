@@ -68,9 +68,11 @@ class AdvancedChessNet(nn.Module):
             nn.BatchNorm2d(2),
             nn.ReLU(),
             nn.Flatten(),
-            nn.Linear(2 * 8 * 8, ACTION_SIZE)
+            nn.Linear(2 * 8 * 8, 1024),   # First dense layer
+            nn.ReLU(),
+            nn.Linear(1024, ACTION_SIZE)  # Output layer
         )
-
+        
         # Value head
         self.valueHead = nn.Sequential(
             nn.Conv2d(512, 1, kernel_size=1),

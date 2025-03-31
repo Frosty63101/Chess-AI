@@ -541,7 +541,7 @@ def train(ai: ChessAI, episodes: int = 1000, lr: float = 0.0001,
             scaler.scale(combinedLoss).backward()
             scaler.step(optimizer)
             scaler.update()
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
             scheduler.step(combinedLoss)
 
             if currentLoss is not None:
@@ -592,9 +592,9 @@ def train(ai: ChessAI, episodes: int = 1000, lr: float = 0.0001,
         if lossHistory:
             if len(lossHistory) >= 10:
                 meanLoss = np.mean(lossHistory[-10:])
-                print(f"Episode {episodeIndex + 1}: Loss={combinedLoss.item():.4f}, Value Loss={valueLoss.item():.4f}, Policy Loss={weightedPolicyLoss.item():.4f}, Mean(10)={meanLoss:.4f}, Noise={noiseLevel:.4f}, Time={timeEnd - timeStart:.2f}s")
+                print(f"Episode {episodeIndex + 1}: Loss={combinedLoss.item():.4f}, Value Loss={valueLoss.item():.4f}, Policy Loss={weightedPolicyLoss.item():.4f}, Mean(10)={meanLoss:.4f}, LR={scheduler.get_last_lr()}, Noise={noiseLevel:.4f}, Time={timeEnd - timeStart:.2f}s")
             else:
-                print(f"Episode {episodeIndex + 1}: Loss={combinedLoss.item():.4f}, Value Loss={valueLoss.item():.4f}, Policy Loss={weightedPolicyLoss.item():.4f}, Noise={noiseLevel:.4f}, Time={timeEnd - timeStart:.2f}s")
+                print(f"Episode {episodeIndex + 1}: Loss={combinedLoss.item():.4f}, Value Loss={valueLoss.item():.4f}, Policy Loss={weightedPolicyLoss.item():.4f}, Noise={noiseLevel:.4f}, LR={scheduler.get_last_lr()}, Time={timeEnd - timeStart:.2f}s")
 
     ai.saveModel(optimizer, scheduler, lossHistory, performanceHistory, replayBuffer)
     print("Training completed and model saved.")
